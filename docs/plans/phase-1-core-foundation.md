@@ -2,6 +2,29 @@
 
 Tracking: epic #18 · Issues: #1, #2, #3, #4, #5 · Spec: `specification/PROJECT_SPEC.md` §5, §7.2, §7.4, §12, §14.1, §15
 
+## Outcome — ✅ completed 2026-11-12
+
+Merged into `dev` via PR #27. Issues #1–#5 closed. **636 tests** passing locally and in CI.
+
+| Wave | Issue | PR | Result |
+|---|---|---|---|
+| 0 | #2 Persistence | direct | Shared fixtures; `BEGIN IMMEDIATE` and conditional-UPDATE concurrency tests (6) |
+| 1 | #1 Setup, config, CI | #20 | Fail-fast settings, sandbox-only PayPal URL, secrets hidden in errors; GitHub Actions (53 tests) |
+| 1 | #3 State machine | #19 | Read-only table, unknown states rejected, CAS without redundant flush (317 tests) |
+| 1 | #4 Policy engine | #26 | 5 bugs fixed incl. malformed docs failing closed (`<SCOPE>_POLICY_INVALID`); 8 example policies (218 tests) |
+| 1 | #5 Audit log | #21 | 4 bugs fixed incl. tz-aware timestamps breaking verification and missing-head detection (42 tests) |
+| 2 | Integration | #27 | Merged #1 → #4 → #3 → #5 with no conflicts; full suite green |
+
+**Lessons for the next phases**
+- Agent worktrees were created from `main`, not from the integration branch; the "verify base commit, else reset onto `origin/<integration>`" step in each brief caught it. Keep that step.
+- Disjoint file ownership worked: four parallel PRs, zero merge conflicts.
+- Each agent found real bugs in the draft code. "Review and complete" briefs plus acceptance-criteria-driven tests pay off.
+
+**Carried into Phase 2**
+- #8 must set `state=State.CREATED` explicitly before transitioning a new request in the same transaction.
+- Open policy questions from #26: categories on an order with no categories; retry after `CANCELLED`/`FAILED` (currently payable, intended); budget findings use the scope key as `policy_id`.
+- Audit PostgreSQL paths are compile-checked only.
+
 ## Goal
 Merge a tested Phase 1 core into `dev`: configuration and CI (#1), persistence and concurrency model (#2), authorization state machine (#3), deterministic policy engine (#4), tamper-evident audit log (#5).
 

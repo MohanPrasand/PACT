@@ -29,3 +29,6 @@ dashboard/dist/
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# Nuvai local tooling state
+.nuvai/
