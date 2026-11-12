@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "max_transaction_minor": 10000,
+  "daily_limit_minor": 15000,
+  "allowed_merchants": ["m_datahub"],
+  "approval_required_above_minor": null
+}

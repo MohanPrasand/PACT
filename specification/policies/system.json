@@ -1,0 +1,5 @@
+{
+  "currency": "USD",
+  "hard_max_transaction_minor": 100000,
+  "allowed_actions": ["PURCHASE"]
+}
