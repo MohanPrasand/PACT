@@ -15,11 +15,18 @@ AI Agent → MCP → PACT Policy Engine → Shared Budget → Human Approval →
 ```bash
 uv sync
 cp .env.example .env     # set PACT_ADMIN_TOKEN; for PayPal: PAYPAL_CLIENT_ID/SECRET + PACT_PAYMENT_PROVIDER=paypal
-uv run pact init         # seed catalogue, policies and demo agents (agent keys -> .pact/agent_keys.json)
-uv run pact serve        # API on http://localhost:8000, docs at /docs
+uv run pact demo         # checks config, seeds data, registers the MCP server for ~/pact-shopper, starts PACT
 ```
 
-Connect Claude Code and ask it to *"find the best mechanical keyboard under $100 and buy it"*: see [`examples/claude_code/`](examples/claude_code/README.md).
+Then, in another terminal:
+
+```bash
+cd ~/pact-shopper && claude      # ask: "Find the best mechanical keyboard under $100 and buy it."
+uv run pact approve              # (from the PACT repo) when Claude says it is waiting for your approval
+```
+
+Open the checkout link Claude gives you and pay. Claude waits for both human steps and confirms the purchase by itself.
+Anything off? `uv run pact doctor` tells you what and how to fix it. Details: [`examples/claude_code/`](examples/claude_code/README.md).
 
 ## Why PACT
 
@@ -117,7 +124,8 @@ A provider timeout moves a payment to `UNKNOWN`. It is reconciled against the pr
 | Merchant Lab (catalogue, cart, orders, payment status, seed) | ✅ merged | `merchant_lab/` |
 | PayPal Sandbox adapter (Orders v2) + simulation adapter | ✅ merged | `adapters/` |
 | REST API, CLI (`pact init/serve/verify-audit`), PayPal return/cancel routes | ✅ | `pact_server/` |
-| MCP server (15 tools, no approval tool) | ✅ | `pact_mcp/` |
+| MCP server (16 tools incl. `pact_wait_for_status`; no approval tool) | ✅ | `pact_mcp/` |
+| Operator CLI: `pact demo`, `doctor`, `approve`, `stop`, server lock | ✅ | `pact_server/cli.py`, `pact_server/ops.py` |
 | Dashboard and storefront UI | ⏳ Phase 6 (#14, #22–#25) | |
 | E2E demo, security review, deployment | ⏳ Phase 7 (#15–#17) | |
 
@@ -191,9 +199,10 @@ Tests never read `.env` and need no PayPal credentials. CI (`.github/workflows/c
 | Configuration | 53 |
 | Authorization service + execution gateway | 50 |
 | REST API + MCP server | 23 |
+| Demo convenience (wait tool, CLI, doctor, lock) | 16 |
 | Audit log | 42 |
 | Persistence and concurrency | 6 |
-| **Total** | **1174** |
+| **Total** | **1190** |
 
 ### Branching
 
