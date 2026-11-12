@@ -49,6 +49,17 @@ def seed_policies(db: Database, directory: Path = DEFAULT_POLICY_DIR, *, overwri
     return created
 
 
+def rotate_agent_key(db: Database, agent_id: str) -> str:
+    """Issue a new API key for an existing agent (the old key stops working). Returns the plaintext key once."""
+    key = new_secret("pact_ak")
+    with db.transaction() as s:
+        agent = s.get(Agent, agent_id)
+        if agent is None:
+            raise KeyError(agent_id)
+        agent.api_key_hash = sha256_hex(key)
+    return key
+
+
 def seed_agents(db: Database, agents=DEMO_AGENTS, user_id: str = DEMO_USER) -> dict[str, str]:
     """Create demo agents that don't exist yet. Returns {agent_id: plaintext api key} for new agents only;
     only the key's SHA-256 hash is stored."""

@@ -21,7 +21,7 @@ EXPECTED_TOOLS = {
     "merchant_search_products", "merchant_get_product", "merchant_create_order", "merchant_get_order",
     "merchant_list_transactions", "merchant_add_to_cart", "merchant_view_cart", "merchant_checkout_cart",
     "pact_request_authorization", "pact_evaluate_policy", "pact_get_authorization_status", "pact_execute_action",
-    "pact_revoke_grant", "pact_get_audit_log", "pact_get_budget",
+    "pact_revoke_grant", "pact_get_audit_log", "pact_get_budget", "pact_wait_for_status",
 }
 
 
