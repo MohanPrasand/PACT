@@ -1,0 +1,28 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+.pact/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Local databases
+*.db
+*.db-wal
+*.db-shm
+
+# Dashboard
+dashboard/node_modules/
+dashboard/dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
