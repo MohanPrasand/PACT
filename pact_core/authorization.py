@@ -7,6 +7,8 @@ Rule: Merchant Lab is queried *before* a transaction opens, never inside one.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
@@ -17,7 +19,7 @@ from sqlalchemy.orm import Session
 from pact_core.budget import BudgetExhausted
 from pact_core.crypto import new_id, request_hash
 from pact_core.errors import Conflict, PactError
-from pact_core.models import AuthorizationRequest, State
+from pact_core.models import AuthorizationRequest, Grant, State
 from pact_core.policy.engine import (
     Effect,
     EvaluationInput,
@@ -29,6 +31,8 @@ from pact_core.policy.engine import (
 )
 from pact_core.runtime import AgentIdentity, PactContext, request_view
 from pact_core.state_machine import RESERVING, transition
+
+log = logging.getLogger(__name__)
 
 # Requests that block another authorization for the same order / count towards duplicate detection.
 ACTIVE_OR_DONE = frozenset(s.value for s in RESERVING) | {State.EXECUTED.value}
@@ -280,8 +284,13 @@ class AuthorizationService:
         self.ctx.audit(s, "GRANT_EXPIRED" if reason == "GRANT_EXPIRED" else "EXPIRED", "system", req.id,
                        reason=reason, reservations_released=released)
 
-    def expire_stale(self) -> list[str]:
-        """Expire pending/approved requests past their window and granted requests whose grant expired."""
+    def expire_stale(self, expire_checkout: Callable[[str], dict[str, Any]] | None = None) -> list[str]:
+        """Expire pending/approved requests past their window and granted requests whose grant expired.
+
+        With ``expire_checkout`` (the gateway's provider-checked timeout), checkouts left open longer than
+        ``checkout_ttl_seconds`` are timed out as well. Those provider calls run after the transaction
+        below has committed, one request at a time; a request that cannot be decided now (provider
+        unreachable, or any error) is left for the next sweep and never stops the others."""
         ctx = self.ctx
         expired: list[str] = []
         with ctx.db.transaction() as s:
@@ -302,7 +311,30 @@ class AuthorizationService:
                 if req.state == State.GRANTED.value:
                     self._expire(s, req, "GRANT_EXPIRED")
                     expired.append(req.id)
+        if expire_checkout is not None:
+            for rid in self.stale_checkouts():
+                try:
+                    view = expire_checkout(rid)
+                except Exception:  # one bad request must not block the sweep; it is retried next time
+                    log.exception("checkout timeout failed for %s", rid)
+                    continue
+                if view["state"] == State.FAILED.value and view["execution"]["failure_reason"] == "CHECKOUT_TIMEOUT":
+                    expired.append(rid)
         return expired
+
+    def stale_checkouts(self) -> list[str]:
+        """EXECUTING requests whose grant was consumed (checkout started) more than the TTL ago. UNKNOWN
+        requests are never listed: their outcome is settled by reconciliation, not by a timeout."""
+        ctx = self.ctx
+        if ctx.checkout_ttl_seconds <= 0:
+            return []
+        with ctx.db.transaction() as s:
+            cutoff = ctx.clock() - timedelta(seconds=ctx.checkout_ttl_seconds)
+            return list(s.execute(
+                select(AuthorizationRequest.id).join(Grant, Grant.request_id == AuthorizationRequest.id).where(
+                    AuthorizationRequest.state == State.EXECUTING.value, Grant.consumed_at <= cutoff,
+                ).order_by(Grant.consumed_at, AuthorizationRequest.id)
+            ).scalars())
 
 
 # ---------------------------------------------------------------------- helpers

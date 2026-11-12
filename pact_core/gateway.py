@@ -6,7 +6,13 @@ Buyer approves at the provider  →  handle_provider_return() captures  →  ver
 
 Ambiguous provider outcomes (timeout, 5xx, dropped connection) move the request to UNKNOWN. It is left
 only through reconcile(), which asks the provider what happened. Payments are never blindly retried;
-provider calls carry deterministic idempotency keys (``pact-<request>-create|capture``).
+provider calls carry deterministic idempotency keys (``pact-<request>-create|capture``). The capture key
+moves on only after the provider definitively declined an attempt (see ``_capture_key``).
+
+Checkout lifecycle: the buyer's cancel link is not terminal (the order is still payable), an explicit
+"cancel this payment" or an operator cancel is, and a checkout left open past ``checkout_ttl_seconds`` is
+timed out by the sweeper. Every terminal path asks the provider first and never releases funds that may
+have been captured.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ from sqlalchemy import select
 from pact_core.crypto import constant_time_equal, request_hash, sha256_hex
 from pact_core.errors import Conflict, NotFound, PactError
 from pact_core.grants import GrantClaim
-from pact_core.models import AuthorizationRequest, State
+from pact_core.models import AuditEvent, AuthorizationRequest, State
 from pact_core.ports import CreatePayment, ProviderError, ProviderOrder, ProviderTimeout
 from pact_core.runtime import AgentIdentity, PactContext, request_view
 from pact_core.state_machine import transition
@@ -30,6 +36,17 @@ BUYER_RETRY = {"INSTRUMENT_DECLINED"}
 # "No such order" from the provider: the simulation adapter's code and PayPal's 404 issue (#38).
 NOT_FOUND = {"RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID"}
 CAPTURE_OUTCOME_UNKNOWN = "PROVIDER_TIMEOUT_ON_CAPTURE"
+# The provider is still waiting for the buyer.
+AWAITING_BUYER = {"CREATED", "PAYER_ACTION_REQUIRED"}
+BUYER_CANCELLED = "BUYER_CANCELLED"
+# provider_status values PACT sets itself while the request stays EXECUTING and the buyer may retry at the
+# same approval_url. A provider answer of "still waiting for the buyer" must not overwrite them.
+BUYER_MAY_RETRY = BUYER_RETRY | {BUYER_CANCELLED}
+
+
+def _captured(po: ProviderOrder) -> bool:
+    """The provider reports a capture (in any state) for this order: only _finalize may decide."""
+    return po.status == "COMPLETED" or bool(po.capture_id or po.capture_status)
 
 
 class ExecuteInput(BaseModel):
@@ -149,8 +166,9 @@ class ExecutionGateway:
             if req.state not in LIVE or not req.provider_order_id:
                 return request_view(req, ctx.grant_for(s, req.id))
             adapter, poid = ctx.adapters[req.provider], req.provider_order_id
+            key = self._capture_key(s, request_id)
         try:
-            po = adapter.capture_order(poid, f"pact-{request_id}-capture")
+            po = adapter.capture_order(poid, key)
         except ProviderTimeout as exc:
             return self._unknown(request_id, "PROVIDER_TIMEOUT_ON_CAPTURE", str(exc))
         except ProviderError as exc:
@@ -160,6 +178,24 @@ class ExecutionGateway:
             return self._after_capture_rejected(request_id, adapter, poid, exc)
         return self._finalize(request_id, po)
 
+    def _declines(self, s, request_id: str) -> int:
+        """Audited definitive buyer-retry declines of a capture (CAPTURE_NOT_COMPLETED, BUYER_RETRY status)."""
+        noted = s.execute(select(AuditEvent.data).where(
+            AuditEvent.request_id == request_id, AuditEvent.event_type == "CAPTURE_NOT_COMPLETED")).scalars()
+        return sum(1 for data in noted if (data or {}).get("provider_status") in BUYER_RETRY)
+
+    def _capture_key(self, s, request_id: str) -> str:
+        """Idempotency key for the next capture call (#41).
+
+        ``pact-<request>-capture`` for the first attempt, ``pact-<request>-capture-<n>`` after ``n`` declines.
+        A decline is a definitive "nothing was captured", so a fresh key lets the buyer's next attempt
+        through instead of replaying the stored decline. The key never advances after a timeout or a
+        not-ready answer: a retry after an unknown outcome reuses it, which is what makes that retry safe.
+        Request ids are at most 40 characters, so the key stays inside the PayPal adapter's 108-character
+        request-id limit."""
+        n = self._declines(s, request_id)
+        return f"pact-{request_id}-capture" + (f"-{n}" if n else "")
+
     def _after_capture_rejected(self, request_id: str, adapter, poid: str, exc: ProviderError) -> dict[str, Any]:
         """The provider refused this capture call. Look at the order once and decide; never capture again
         from here (#39: capture -> reconcile -> capture recursed without bound)."""
@@ -168,7 +204,7 @@ class ExecutionGateway:
         except (ProviderTimeout, ProviderError):
             self._note_status(request_id, exc.code)  # cannot tell yet; the next poll retries
             return self._view(request_id)
-        if po.status == "COMPLETED" or po.capture_id or po.capture_status:
+        if _captured(po):
             return self._finalize(request_id, po)  # e.g. ORDER_ALREADY_CAPTURED: money moved earlier
         if exc.retryable:
             self._note_status(request_id, exc.code)  # rate limit / transient auth: the next poll retries
@@ -228,7 +264,9 @@ class ExecutionGateway:
         return self._capture(self.request_for_provider_order(provider_order_id))
 
     def handle_provider_cancel(self, provider_order_id: str) -> dict[str, Any]:
-        """Buyer cancelled. Reconcile first (never release funds that might have been captured)."""
+        """The buyer followed the provider's cancel link (#40). That is not terminal: the order is still
+        payable, so the request stays EXECUTING with provider_status BUYER_CANCELLED and the buyer can go
+        back to the same approval_url. The provider is asked first; a captured order is finalized."""
         ctx = self.ctx
         rid = self.request_for_provider_order(provider_order_id)
         with ctx.db.transaction() as s:
@@ -245,10 +283,20 @@ class ExecutionGateway:
                 return self._cancel_unverified(rid)
             if self._not_found_after_unknown_capture(rid, exc.code):
                 return self._view(rid)
-            po = None  # no order at the provider, so nothing was captured
-        if po is not None and po.status == "COMPLETED":
+            # No order at the provider, so nothing was captured and there is nothing left to retry.
+            return self._fail(rid, BUYER_CANCELLED, merchant_status="CANCELLED")
+        if _captured(po):
             return self._finalize(rid, po)
-        return self._fail(rid, "BUYER_CANCELLED", merchant_status="CANCELLED")
+        with ctx.db.transaction() as s:
+            req = ctx.load_request(s, rid)
+            unknown = req.state == State.UNKNOWN.value
+            if req.state == State.EXECUTING.value and req.provider_status != BUYER_CANCELLED:
+                req.provider_status = BUYER_CANCELLED
+                ctx.audit(s, "CHECKOUT_CANCELLED_BY_BUYER", "buyer", req.id, provider_order_id=provider_order_id,
+                          provider_order_status=po.status)
+        if unknown:
+            return self._reconcile_with(rid, adapter, provider_order_id)  # the only way out of UNKNOWN
+        return self._view(rid)
 
     def _cancel_unverified(self, request_id: str) -> dict[str, Any]:
         if self._capture_outcome_unknown(request_id):
@@ -258,20 +306,52 @@ class ExecutionGateway:
     def abandon(self, request_id: str, actor: str) -> dict[str, Any]:
         """Operator cancels a payment stuck in checkout (e.g. the buyer gave up). The provider is asked first:
         a captured payment is finalized, never cancelled; otherwise the request fails and funds are released."""
+        with self.ctx.db.transaction() as s:
+            req = self.ctx.load_request(s, request_id)
+            if req.state not in LIVE:
+                raise Conflict("NOT_EXECUTING", f"Request is {req.state}; only EXECUTING/UNKNOWN payments can be cancelled")
+        return self._abandon(request_id, actor=actor, reason="ABANDONED_CHECKOUT", event="CANCEL_REQUESTED",
+                             merchant_status="CANCELLED")
+
+    def buyer_abandon(self, provider_order_id: str) -> dict[str, Any]:
+        """The buyer explicitly gives up this payment (#40): the same provider-checked terminal path as
+        ``abandon``. A request that is no longer in checkout returns its view, so a double submit is harmless."""
+        return self._abandon(self.request_for_provider_order(provider_order_id), actor="buyer",
+                             reason=BUYER_CANCELLED, event="CANCEL_REQUESTED", merchant_status="CANCELLED")
+
+    def expire_checkout(self, request_id: str) -> dict[str, Any]:
+        """Time out a checkout the buyer never finished (#42); called by the expiry sweep, outside any
+        transaction. Only EXECUTING requests are touched: UNKNOWN ones, and any request with a capture call
+        of unknown outcome, stay for reconciliation / manual review. A captured order is finalized and an
+        approved one is captured instead of failed. If the provider cannot be asked, nothing changes and the
+        next sweep tries again."""
+        try:
+            return self._abandon(request_id, actor="system", reason="CHECKOUT_TIMEOUT", event="CHECKOUT_TIMED_OUT",
+                                 merchant_status="FAILED", timeout=True)
+        except Conflict:
+            return self._view(request_id)  # CANNOT_VERIFY_PROVIDER: leave it for the next sweep
+
+    def _abandon(self, request_id: str, *, actor: str, reason: str, event: str, merchant_status: str,
+                 timeout: bool = False) -> dict[str, Any]:
+        """Provider-checked terminal path shared by the operator cancel, the buyer's explicit cancel and the
+        checkout timeout. Funds are released only once the provider is known to hold no capture; when that
+        cannot be established it raises CANNOT_VERIFY_PROVIDER and changes nothing."""
         ctx = self.ctx
         with ctx.db.transaction() as s:
             req = ctx.load_request(s, request_id)
-            if req.state not in LIVE:
-                raise Conflict("NOT_EXECUTING", f"Request is {req.state}; only EXECUTING/UNKNOWN payments can be cancelled")
+            if req.state not in LIVE or (timeout and (req.state != State.EXECUTING.value
+                                                      or req.failure_reason == CAPTURE_OUTCOME_UNKNOWN)):
+                return request_view(req, ctx.grant_for(s, req.id))
             poid = req.provider_order_id
         if poid is None:
             view = self.reconcile(request_id)  # resolve an unknown create first (idempotent)
             poid = view["execution"]["provider_order_id"]
-            if view["state"] not in LIVE:
+            if view["state"] not in LIVE or (timeout and view["state"] != State.EXECUTING.value):
                 return view
         with ctx.db.transaction() as s:
             req = ctx.load_request(s, request_id)
             adapter = ctx.adapters[req.provider]
+            declines = self._declines(s, request_id)
         if poid is not None:
             try:
                 po = adapter.get_order(poid)
@@ -282,11 +362,18 @@ class ExecutionGateway:
                     raise Conflict("CANNOT_VERIFY_PROVIDER",
                                    f"Could not confirm the provider state ({type(exc).__name__}); try again later") from None
                 po = None
-            if po is not None and po.status == "COMPLETED":
+            if po is not None and _captured(po):
                 return self._finalize(request_id, po)
-        with ctx.db.transaction() as s:
-            ctx.audit(s, "CANCEL_REQUESTED", actor, request_id, provider_order_id=poid)
-        return self._fail(request_id, "ABANDONED_CHECKOUT", merchant_status="CANCELLED")
+            if timeout and po is not None and po.status == "APPROVED":
+                # The buyer approved but never came back: take the payment rather than fail it.
+                view = self._capture(request_id)
+                with ctx.db.transaction() as s:
+                    declined = self._declines(s, request_id) > declines
+                if view["state"] != State.EXECUTING.value or not declined:
+                    return view  # captured, failed, unknown or not ready: nothing more to decide here
+                # Definitively declined just now (nothing captured) and the checkout window is over.
+        return self._fail(request_id, reason, merchant_status=merchant_status,
+                          note=(event, actor, {"provider_order_id": poid}))
 
     # ------------------------------------------------------------------ reconciliation
     def reconcile(self, request_id: str) -> dict[str, Any]:
@@ -316,24 +403,37 @@ class ExecutionGateway:
             if exc.code in NOT_FOUND and not self._not_found_after_unknown_capture(request_id, exc.code):
                 return self._fail(request_id, "PROVIDER_ORDER_NOT_FOUND")
             return self._view(request_id)
+        seen = "CAPTURE_PENDING" if po.capture_status == "PENDING" else po.status
         with ctx.db.transaction() as s:
-            ctx.audit(s, "RECONCILED", "gateway", request_id, provider_status=po.status,
-                      capture_status=po.capture_status)
+            req = ctx.load_request(s, request_id)
+            if req.state not in LIVE:
+                return request_view(req, ctx.grant_for(s, req.id))
+            unknown = req.state == State.UNKNOWN.value
+            # The buyer cancelled or was declined and has not acted since: keep PACT's status (#40, #41).
+            keep = req.provider_status in BUYER_MAY_RETRY and po.status in AWAITING_BUYER
+            # Declined and still approved with the declined funding source: capturing again from a poll
+            # would only repeat the decline. The buyer's return (or the checkout timeout) retries it.
+            wait_for_buyer = req.provider_status in BUYER_RETRY and po.status == "APPROVED" and not unknown
+            # Audit only what is new (#42): an unchanged poll writes nothing.
+            if (seen != req.provider_status and not keep and not wait_for_buyer) or (unknown and po.status in AWAITING_BUYER):
+                ctx.audit(s, "RECONCILED", "gateway", request_id, provider_status=po.status,
+                          capture_status=po.capture_status)
         if po.status == "COMPLETED":
             return self._finalize(request_id, po)
         if po.status == "APPROVED":
-            return self._capture(request_id)
-        if po.status in ("CREATED", "PAYER_ACTION_REQUIRED"):
-            with ctx.db.transaction() as s:
-                req = ctx.load_request(s, request_id)
-                if req.state == State.UNKNOWN.value:
-                    transition(s, req, State.EXECUTING, ctx.clock)
-                req.provider_status = po.status
-                if po.approval_url:
-                    req.approval_url = po.approval_url
-            return self._view(request_id)
+            return self._view(request_id) if wait_for_buyer else self._capture(request_id)
         if po.status == "VOIDED":
             return self._fail(request_id, "PROVIDER_ORDER_VOIDED")
+        with ctx.db.transaction() as s:
+            req = ctx.load_request(s, request_id)
+            if req.state in LIVE:
+                if po.status in AWAITING_BUYER:
+                    if req.state == State.UNKNOWN.value:
+                        transition(s, req, State.EXECUTING, ctx.clock)
+                    if po.approval_url:
+                        req.approval_url = po.approval_url
+                if not keep:
+                    req.provider_status = po.status
         return self._view(request_id)
 
     # ------------------------------------------------------------------ state helpers
@@ -366,8 +466,10 @@ class ExecutionGateway:
                 ctx.audit(s, "PROVIDER_TIMEOUT", "gateway", req.id, reason=reason, detail=detail[:200])
             return request_view(req, ctx.grant_for(s, req.id))
 
-    def _fail(self, request_id: str, reason: str, *, merchant_status: str | None = "FAILED") -> dict[str, Any]:
-        """Terminal failure. Only called once the provider state is known not to include a capture."""
+    def _fail(self, request_id: str, reason: str, *, merchant_status: str | None = "FAILED",
+              note: tuple[str, str, dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Terminal failure. Only called once the provider state is known not to include a capture.
+        ``note`` is an ``(event, actor, data)`` audit record written with the failure, only if it happens."""
         ctx = self.ctx
         with ctx.db.transaction() as s:
             req = ctx.load_request(s, request_id)
@@ -376,6 +478,8 @@ class ExecutionGateway:
             transition(s, req, State.FAILED, ctx.clock)
             released = ctx.budget.release(s, req.id)
             req.failure_reason = reason
+            if note is not None:
+                ctx.audit(s, note[0], note[1], req.id, **note[2])
             ctx.audit(s, "EXECUTION_FAILED", "gateway", req.id, reason=reason, reservations_released=released)
             order_id = req.order_id
         if merchant_status:
@@ -385,6 +489,12 @@ class ExecutionGateway:
     def _note_status(self, request_id: str, status: str) -> None:
         with self.ctx.db.transaction() as s:
             req = self.ctx.load_request(s, request_id)
+            if status in NOT_READY and req.provider_status in BUYER_MAY_RETRY:
+                return  # "not approved yet" is no news after a cancel or decline: keep that status
+            # Every buyer-retry decline is audited (the capture key counts them); anything else only when
+            # it is news, so repeated polls of e.g. a pending capture do not fill the log.
+            if req.provider_status == status and status not in BUYER_RETRY:
+                return
             req.provider_status = status
             self.ctx.audit(s, "CAPTURE_NOT_COMPLETED", "gateway", req.id, provider_status=status)
 

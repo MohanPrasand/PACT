@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     paypal_landing_page: Literal["LOGIN", "GUEST_CHECKOUT", "NO_PREFERENCE"] = Field(
         "LOGIN", alias="PAYPAL_LANDING_PAGE")
 
+    # How long a buyer may leave a checkout open before PACT times it out and releases the reservation
+    # (provider-checked: a captured or approved order is completed instead). 0 disables the timeout.
+    checkout_ttl_seconds: int = Field(3600, ge=0, alias="PACT_CHECKOUT_TTL_SECONDS")
+
     @field_validator("currency")
     @classmethod
     def _currency_is_iso_code(cls, value: str) -> str:

@@ -7,6 +7,7 @@ import threading
 import pytest
 
 from pact_core.errors import Forbidden, NotFound, PactError
+from pact_core.ports import ProviderError, ProviderOrder, ProviderTimeout
 from tests.pact_env import build_env
 
 
@@ -305,3 +306,217 @@ def test_audit_chain_valid_after_mixed_activity(env):
     env.granted("Atlas")
     env.core.request_authorization(env.agent(), env.auth_input(env.order(env.product("Unbranded")["product_id"])))
     assert env.core.verify_audit()["valid"] is True
+
+
+# ---------------------------------------------------------------- #42 checkout timeout
+
+def checkout(env, product="Atlas"):
+    """A granted request taken into checkout: (order, request id, provider order id)."""
+    order, view, token = env.granted(product)
+    v = env.core.execute(env.agent(), env.exec_input(view, order, token))
+    assert v["state"] == "EXECUTING"
+    return order, view["request_id"], v["execution"]["provider_order_id"]
+
+
+def state_of(env, rid):
+    d = env.core.request_detail(rid)
+    return d["state"], d["execution"]["failure_reason"]
+
+
+def assert_consistent(env):
+    assert env.core.verify_audit()["valid"]
+    with env.core.db.transaction() as s:
+        assert env.core.ctx.budget.check_invariants(s) == []
+
+
+def test_checkout_timeout_fails_and_releases(env):
+    order, rid, poid = checkout(env)
+    env.clock.advance(seconds=3599)
+    assert env.core.expire_stale() == [] and state_of(env, rid) == ("EXECUTING", None)
+    assert scope(env, "org:global")["reserved_minor"] == 7900
+
+    env.clock.advance(seconds=2)
+    assert env.core.expire_stale() == [rid]
+    assert state_of(env, rid) == ("FAILED", "CHECKOUT_TIMEOUT")
+    assert scope(env, "org:global")["reserved_minor"] == 0 and scope(env, "org:global")["settled_minor"] == 0
+    assert env.lab.get_order(order["order_id"])["payment_status"] == "FAILED"
+    assert events(env, rid)[-2:] == ["CHECKOUT_TIMED_OUT", "EXECUTION_FAILED"]
+    timed_out = env.core.audit_events(request_id=rid, event_type="CHECKOUT_TIMED_OUT")
+    assert len(timed_out) == 1 and timed_out[0]["actor"] == "system"
+    assert env.core.expire_stale() == []  # nothing left to do
+    assert_consistent(env)
+
+
+def test_checkout_timeout_is_reported_with_other_expiries(env):
+    order, rid, poid = checkout(env)
+    pending = env.core.request_authorization(env.agent(), env.auth_input(env.order(env.product("Atlas")["product_id"])))
+    env.clock.advance(seconds=3601)
+    assert env.core.expire_stale() == [pending["request_id"], rid]
+    assert_consistent(env)
+
+
+def test_checkout_timeout_after_buyer_cancel_or_gone_order(env, monkeypatch):
+    order, rid, poid = checkout(env)
+    env.core.handle_provider_cancel(poid)
+    env.clock.advance(seconds=3601)
+
+    def gone(provider_order_id):
+        raise ProviderError("INVALID_RESOURCE_ID", "Specified resource ID does not exist.")
+    monkeypatch.setattr(env.sim, "get_order", gone)
+    assert env.core.expire_stale() == [rid]
+    assert state_of(env, rid) == ("FAILED", "CHECKOUT_TIMEOUT")
+    assert scope(env, "org:global")["reserved_minor"] == 0
+    assert_consistent(env)
+
+
+def test_checkout_timeout_finalizes_a_captured_order(env):
+    order, rid, poid = checkout(env)
+    env.sim.buyer_approve(poid)
+    env.sim.capture_order(poid, "captured-elsewhere")  # money moved at the provider, PACT not told
+    env.clock.advance(seconds=3601)
+    assert env.core.expire_stale() == []
+    assert state_of(env, rid) == ("EXECUTED", None)
+    assert scope(env, "org:global")["settled_minor"] == 7900 and scope(env, "org:global")["reserved_minor"] == 0
+    assert "EXECUTION_FAILED" not in events(env, rid) and "CHECKOUT_TIMED_OUT" not in events(env, rid)
+    assert_consistent(env)
+
+
+def test_checkout_timeout_captures_an_approved_order(env):
+    order, rid, poid = checkout(env)
+    env.sim.buyer_approve(poid)  # approved, but the buyer's browser never came back
+    env.clock.advance(seconds=3601)
+    assert env.core.expire_stale() == []
+    assert state_of(env, rid) == ("EXECUTED", None)
+    assert env.lab.get_order(order["order_id"])["payment_status"] == "CAPTURED"
+    assert scope(env, "org:global")["settled_minor"] == 7900 and scope(env, "org:global")["reserved_minor"] == 0
+    assert len(env.core.audit_events(event_type="PAYMENT_CAPTURED")) == 1
+    assert_consistent(env)
+
+
+def test_checkout_timeout_fails_an_approved_order_whose_capture_is_declined(env, monkeypatch):
+    order, rid, poid = checkout(env)
+    env.sim.buyer_approve(poid)
+    attempts = []
+
+    def decline(provider_order_id, idempotency_key):
+        attempts.append(idempotency_key)
+        raise ProviderError("INSTRUMENT_DECLINED", "The instrument presented was declined.")
+    monkeypatch.setattr(env.sim, "capture_order", decline)
+    env.clock.advance(seconds=3601)
+    assert env.core.expire_stale() == [rid]
+    assert state_of(env, rid) == ("FAILED", "CHECKOUT_TIMEOUT")
+    assert attempts == [f"pact-{rid}-capture"]  # one attempt, definitively declined: nothing was captured
+    assert env.sim.lookup(poid).status == "APPROVED"
+    assert scope(env, "org:global")["reserved_minor"] == 0 and scope(env, "org:global")["settled_minor"] == 0
+    assert_consistent(env)
+
+
+def test_checkout_timeout_capture_with_unknown_outcome_is_not_failed(env):
+    order, rid, poid = checkout(env)
+    env.sim.buyer_approve(poid)
+    env.sim.inject("capture", "timeout", after_side_effect=True)
+    env.clock.advance(seconds=3601)
+    assert env.core.expire_stale() == []
+    assert state_of(env, rid) == ("UNKNOWN", "PROVIDER_TIMEOUT_ON_CAPTURE")
+    assert scope(env, "org:global")["reserved_minor"] == 7900
+    assert env.core.expire_stale() == [] and state_of(env, rid)[0] == "UNKNOWN"  # UNKNOWN is never swept
+    assert env.core.reconcile(rid)["state"] == "EXECUTED"
+    assert_consistent(env)
+
+
+def test_checkout_timeout_never_touches_unknown_requests(env, monkeypatch):
+    order, view, token = env.granted()
+    env.sim.inject("create", "timeout", after_side_effect=True)
+    assert env.core.execute(env.agent(), env.exec_input(view, order, token))["state"] == "UNKNOWN"
+    rid = view["request_id"]
+    lookups = []
+    real = env.sim.get_order
+    monkeypatch.setattr(env.sim, "get_order", lambda poid: (lookups.append(poid), real(poid))[1])
+    env.clock.advance(seconds=7200)
+    assert env.core.expire_stale() == []
+    assert state_of(env, rid) == ("UNKNOWN", "PROVIDER_TIMEOUT_ON_CREATE") and lookups == []
+    assert scope(env, "org:global")["reserved_minor"] == 7900
+    assert_consistent(env)
+
+
+def test_checkout_timeout_leaves_unknown_capture_outcome_for_manual_review(env, monkeypatch):
+    """A capture call with an unknown outcome may have moved money. Even back in EXECUTING, such a request
+    is never timed out and its failure reason is kept."""
+    order, rid, poid = checkout(env)
+    env.sim.buyer_approve(poid)
+    env.sim.inject("capture", "timeout")
+    assert env.core.handle_provider_return(poid)["state"] == "UNKNOWN"
+    # The provider then reports the order as still waiting for the buyer: back to EXECUTING, reason kept.
+    monkeypatch.setattr(env.sim, "get_order",
+                        lambda p: ProviderOrder(provider_order_id=p, status="PAYER_ACTION_REQUIRED"))
+    assert env.core.reconcile(rid)["state"] == "EXECUTING"
+    assert state_of(env, rid) == ("EXECUTING", "PROVIDER_TIMEOUT_ON_CAPTURE")
+
+    lookups = []
+    monkeypatch.setattr(env.sim, "get_order", lambda p: lookups.append(p))
+    env.clock.advance(seconds=7200)
+    assert env.core.expire_stale() == []
+    assert state_of(env, rid) == ("EXECUTING", "PROVIDER_TIMEOUT_ON_CAPTURE") and lookups == []
+    assert scope(env, "org:global")["reserved_minor"] == 7900
+    assert "EXECUTION_FAILED" not in events(env, rid)
+    assert_consistent(env)
+
+
+def test_checkout_timeout_waits_when_the_provider_is_unreachable(env, monkeypatch):
+    order, rid, poid = checkout(env)
+    env.clock.advance(seconds=3601)
+    env.sim.inject("get", "timeout")
+    assert env.core.expire_stale() == []  # no exception, nothing released
+    assert state_of(env, rid) == ("EXECUTING", None)
+    env.sim.inject("get", "error", code="INTERNAL_SERVER_ERROR")
+    assert env.core.expire_stale() == [] and state_of(env, rid) == ("EXECUTING", None)
+    assert scope(env, "org:global")["reserved_minor"] == 7900
+
+    real = env.sim.get_order
+
+    def broken(provider_order_id):
+        raise RuntimeError("adapter bug")
+    monkeypatch.setattr(env.sim, "get_order", broken)
+    assert env.core.expire_stale() == [] and state_of(env, rid) == ("EXECUTING", None)
+
+    monkeypatch.setattr(env.sim, "get_order", real)  # the provider is back: the next sweep decides
+    assert env.core.expire_stale() == [rid]
+    assert state_of(env, rid) == ("FAILED", "CHECKOUT_TIMEOUT")
+    assert_consistent(env)
+
+
+def test_one_undecidable_checkout_does_not_block_the_others(env, monkeypatch):
+    _, first, first_poid = checkout(env, "mouse")
+    env.clock.advance(seconds=1)
+    _, second, _ = checkout(env, "mouse")
+    env.clock.advance(seconds=3601)
+    real = env.sim.get_order
+
+    def flaky(provider_order_id):
+        if provider_order_id == first_poid:
+            raise ProviderTimeout("read timed out")
+        return real(provider_order_id)
+    monkeypatch.setattr(env.sim, "get_order", flaky)
+    assert env.core.expire_stale() == [second]
+    assert state_of(env, first)[0] == "EXECUTING" and state_of(env, second) == ("FAILED", "CHECKOUT_TIMEOUT")
+    assert_consistent(env)
+
+
+def test_checkout_timeout_can_be_disabled(env):
+    order, rid, poid = checkout(env)
+    env.core.ctx.checkout_ttl_seconds = 0
+    env.clock.advance(days=2)
+    assert env.core.expire_stale() == [] and state_of(env, rid) == ("EXECUTING", None)
+
+
+def test_checkout_ttl_is_configurable_and_defaults_to_an_hour(db, clock):
+    from merchant_lab.service import MerchantLab, MerchantLabOrderSource
+    from pact_core.core import PactCore
+
+    env = build_env(db, clock)
+    assert env.core.ctx.checkout_ttl_seconds == 3600
+    env.core = PactCore(db, MerchantLabOrderSource(MerchantLab(db)), {"simulation": env.sim}, provider="simulation",
+                        currency="USD", public_url="http://localhost:8000", checkout_ttl_seconds=60, clock=clock)
+    order, rid, poid = checkout(env)
+    env.clock.advance(seconds=61)
+    assert env.core.expire_stale() == [rid]

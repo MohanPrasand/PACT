@@ -7,6 +7,8 @@ deny or change policy.
 
 from __future__ import annotations
 
+import threading
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -23,16 +25,23 @@ from pact_core.policy.rules import validate_rules
 from pact_core.ports import OrderSource, PaymentAdapter
 from pact_core.runtime import AgentIdentity, PactContext
 
+# Minimum time between provider lookups caused by status polls of one request while nothing changes (#42).
+STATUS_POLL_MIN_INTERVAL_SECONDS = 2.0
+_LIVE = (State.EXECUTING.value, State.UNKNOWN.value)
+
 
 class PactCore:
     def __init__(self, db: Database, orders: OrderSource, adapters: dict[str, PaymentAdapter], *,
                  provider: str, currency: str, public_url: str, grant_ttl_seconds: int = 600,
-                 approval_ttl_seconds: int = 1800, clock: Clock = utcnow):
+                 approval_ttl_seconds: int = 1800, checkout_ttl_seconds: int = 3600, clock: Clock = utcnow):
         self.ctx = PactContext(db=db, clock=clock, orders=orders, adapters=adapters, provider=provider,
                                currency=currency, public_url=public_url, approval_ttl_seconds=approval_ttl_seconds,
-                               grant_ttl_seconds=grant_ttl_seconds)
+                               grant_ttl_seconds=grant_ttl_seconds, checkout_ttl_seconds=checkout_ttl_seconds)
         self.auth = AuthorizationService(self.ctx)
         self.gateway = ExecutionGateway(self.ctx)
+        # request id -> time of the last status-poll lookup that found nothing new (in memory, per process).
+        self._idle_polls: dict[str, datetime] = {}
+        self._idle_polls_lock = threading.Lock()
 
     @property
     def db(self) -> Database:
@@ -60,10 +69,36 @@ class PactCore:
 
     def get_status(self, agent: AgentIdentity, request_id: str) -> dict[str, Any]:
         view = self.auth.get_status(agent, request_id)
-        if view["state"] in (State.EXECUTING.value, State.UNKNOWN.value) and "grant_token" not in view:
+        if view["state"] in _LIVE and "grant_token" not in view and not self._polled_recently(request_id):
             self.gateway.reconcile(request_id)  # pick up a buyer approval or resolve an UNKNOWN outcome
-            view = self.auth.get_status(agent, request_id)
+            after = self.auth.get_status(agent, request_id)
+            self._note_poll(request_id, changed=_progress(after) != _progress(view))
+            view = after
         return view
+
+    def _polled_recently(self, request_id: str) -> bool:
+        """True while the last status-poll lookup for this request found nothing new less than
+        STATUS_POLL_MIN_INTERVAL_SECONDS ago: the stored view is returned without asking the provider.
+        A lookup that did find something is never followed by a pause. Admin reconcile and the buyer
+        return/cancel paths are not throttled.
+
+        Time is ``ctx.clock``. A clock that has not moved at all since that lookup (a frozen clock, never a
+        real one) does not count as "recently": otherwise a stopped clock would switch polling off for good."""
+        with self._idle_polls_lock:
+            last = self._idle_polls.get(request_id)
+        return last is not None and _within_poll_interval(self.ctx.clock(), last)
+
+    def _note_poll(self, request_id: str, *, changed: bool) -> None:
+        now = self.ctx.clock()
+        with self._idle_polls_lock:
+            if changed:
+                self._idle_polls.pop(request_id, None)
+                return
+            self._idle_polls[request_id] = now
+            if len(self._idle_polls) > 1024:  # forget requests nobody polls any more
+                for rid, last in list(self._idle_polls.items()):
+                    if rid != request_id and not _within_poll_interval(now, last):
+                        del self._idle_polls[rid]
 
     def execute(self, agent: AgentIdentity, data: dict | ExecuteInput) -> dict[str, Any]:
         return self.gateway.execute(agent, _model(ExecuteInput, data))
@@ -110,7 +145,8 @@ class PactCore:
         return self.gateway.reconcile(request_id)
 
     def expire_stale(self) -> list[str]:
-        return self.auth.expire_stale()
+        """Expire stale authorizations and time out abandoned checkouts; returns the ids it expired."""
+        return self.auth.expire_stale(self.gateway.expire_checkout)
 
     def list_requests(self, state: str | None = None, limit: int = 100) -> list[dict]:
         from pact_core.runtime import request_view
@@ -200,7 +236,21 @@ class PactCore:
         return self.gateway.handle_provider_return(provider_order_id)
 
     def handle_provider_cancel(self, provider_order_id: str) -> dict[str, Any]:
+        """Buyer followed the provider's cancel link. Not terminal: the request stays EXECUTING."""
         return self.gateway.handle_provider_cancel(provider_order_id)
+
+    def buyer_abandon(self, provider_order_id: str) -> dict[str, Any]:
+        """Buyer explicitly cancels this payment. Terminal (FAILED / BUYER_CANCELLED) unless already captured."""
+        return self.gateway.buyer_abandon(provider_order_id)
+
+
+def _within_poll_interval(now: datetime, last: datetime) -> bool:
+    return 0 < (now - last).total_seconds() < STATUS_POLL_MIN_INTERVAL_SECONDS
+
+
+def _progress(view: dict[str, Any]) -> tuple:
+    ex = view["execution"]
+    return (view["state"], ex["provider_status"], ex["capture_id"], ex["failure_reason"], ex["approval_url"])
 
 
 def _model(cls, data):

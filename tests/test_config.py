@@ -54,6 +54,7 @@ def test_defaults_are_safe(monkeypatch):
     assert s.admin_token is None
     assert s.paypal_client_secret is None
     assert s.paypal_landing_page == "LOGIN"
+    assert s.checkout_ttl_seconds == 3600
 
 
 def test_values_come_from_environment(monkeypatch):
@@ -277,3 +278,22 @@ def test_credentials_embedded_in_base_url_not_echoed(monkeypatch):
     with pytest.raises(ValidationError) as exc:
         load(monkeypatch, PAYPAL_BASE_URL="https://user:hunter2-secret@api-m.paypal.com")
     assert "hunter2-secret" not in error_text(exc)
+
+
+# --- checkout timeout -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value,expected", [("0", 0), ("60", 60), ("86400", 86400)])
+def test_checkout_ttl_from_environment(monkeypatch, value, expected):
+    assert load(monkeypatch, PACT_CHECKOUT_TTL_SECONDS=value).checkout_ttl_seconds == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "soon", "1.5"])
+def test_invalid_checkout_ttl_rejected(monkeypatch, value):
+    with pytest.raises(ValidationError) as exc:
+        load(monkeypatch, PACT_CHECKOUT_TTL_SECONDS=value)
+    assert "PACT_CHECKOUT_TTL_SECONDS" in str(exc.value)
+
+
+def test_empty_checkout_ttl_means_default(monkeypatch):
+    assert load(monkeypatch, PACT_CHECKOUT_TTL_SECONDS="").checkout_ttl_seconds == 3600

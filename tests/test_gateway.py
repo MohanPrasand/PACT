@@ -13,7 +13,7 @@ from merchant_lab.service import MerchantLabOrderSource
 from pact_core.core import PactCore
 from pact_core.errors import PactError
 from pact_core.gateway import NOT_FOUND
-from pact_core.ports import ProviderError
+from pact_core.ports import ProviderError, ProviderOrder, ProviderTimeout
 from tests.pact_env import PUBLIC_URL, build_env
 
 
@@ -146,12 +146,30 @@ def test_concurrent_execution_with_one_grant(env):
     assert len(env.core.audit_events(event_type="PROVIDER_ORDER_CREATED")) == 1
 
 
-def test_buyer_cancellation_releases(env):
+def test_buyer_cancel_link_is_not_terminal(env):
+    """#40: the provider's cancel link only records that the buyer backed out; nothing is released."""
+    order, view, token, v = start(env)
+    poid = v["execution"]["provider_order_id"]
+    r = env.core.handle_provider_cancel(poid)
+    assert r["state"] == "EXECUTING" and r["execution"]["provider_status"] == "BUYER_CANCELLED"
+    assert r["execution"]["failure_reason"] is None and r["execution"]["approval_url"] == v["execution"]["approval_url"]
+    assert env.lab.get_order(order["order_id"])["payment_status"] == "PENDING"
+    assert org(env)["reserved_minor"] == 7900 and org(env)["settled_minor"] == 0
+    env.core.handle_provider_cancel(poid)  # a second hit is not a new transition
+    assert events(env, view["request_id"]).count("CHECKOUT_CANCELLED_BY_BUYER") == 1
+    assert "EXECUTION_FAILED" not in events(env, view["request_id"])
+
+
+def test_cancel_link_on_order_voided_at_provider_fails_on_next_poll(env):
+    """The simulated checkout's Cancel voids the order. The cancel link itself stays non-terminal; the next
+    status poll sees the void and releases."""
     order, view, token, v = start(env)
     env.sim.buyer_cancel(v["execution"]["provider_order_id"])
     r = env.core.handle_provider_cancel(v["execution"]["provider_order_id"])
-    assert r["state"] == "FAILED" and r["execution"]["failure_reason"] == "BUYER_CANCELLED"
-    assert env.lab.get_order(order["order_id"])["payment_status"] == "CANCELLED"
+    assert r["state"] == "EXECUTING" and r["execution"]["provider_status"] == "BUYER_CANCELLED"
+    assert org(env)["reserved_minor"] == 7900
+    s = env.core.get_status(env.agent(), view["request_id"])
+    assert s["state"] == "FAILED" and s["execution"]["failure_reason"] == "PROVIDER_ORDER_VOIDED"
     assert org(env)["reserved_minor"] == 0 and org(env)["settled_minor"] == 0
 
 
@@ -479,3 +497,297 @@ def test_capture_rejected_but_lookup_fails_keeps_reservation(env, monkeypatch):
     assert calls == {"capture_order": 1, "get_order": 1}
     assert org(env)["reserved_minor"] == 7900
     assert_consistent(env)
+
+
+# ---------------------------------------------------------------------- #40 buyer cancel is not terminal
+def record_captures(env, monkeypatch, *faults):
+    """Record the idempotency key of every capture call. The first ``len(faults)`` calls raise the given
+    exceptions without capturing (the order stays APPROVED at the provider); later calls are real."""
+    keys, pending, real = [], list(faults), env.sim.capture_order
+
+    def capture(provider_order_id, idempotency_key):
+        keys.append(idempotency_key)
+        if pending:
+            raise pending.pop(0)
+        return real(provider_order_id, idempotency_key)
+    monkeypatch.setattr(env.sim, "capture_order", capture)
+    return keys
+
+
+def declined():
+    return ProviderError("INSTRUMENT_DECLINED", "The instrument presented was declined.")
+
+
+def test_cancel_then_approve_then_return_executes_same_order(env):
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    env.core.handle_provider_cancel(poid)
+
+    # The provider still waits for the buyer: polls keep PACT's status and write nothing.
+    s = env.core.get_status(env.agent(), rid)
+    assert s["state"] == "EXECUTING" and s["execution"]["provider_status"] == "BUYER_CANCELLED"
+    assert s["execution"]["approval_url"] == v["execution"]["approval_url"]
+    assert "RECONCILED" not in events(env, rid)
+
+    env.sim.buyer_approve(poid)  # the buyer went back to the same approval_url
+    done = env.core.handle_provider_return(poid)
+    assert done["state"] == "EXECUTED" and done["execution"]["provider_order_id"] == poid
+    assert done["execution"]["provider_status"] == "COMPLETED"
+    assert env.lab.get_order(order["order_id"])["payment_status"] == "CAPTURED"
+    assert org(env)["settled_minor"] == 7900 and org(env)["reserved_minor"] == 0
+    assert len(env.core.audit_events(event_type="PROVIDER_ORDER_CREATED")) == 1
+    assert_consistent(env)
+
+
+def test_cancel_then_approve_is_captured_by_status_poll(env):
+    order, view, token, v = start(env)
+    poid = v["execution"]["provider_order_id"]
+    env.core.handle_provider_cancel(poid)
+    env.sim.buyer_approve(poid)
+    s = env.core.get_status(env.agent(), view["request_id"])
+    assert s["state"] == "EXECUTED" and s["execution"]["provider_status"] == "COMPLETED"
+    assert org(env)["settled_minor"] == 7900
+    assert_consistent(env)
+
+
+def test_return_before_approval_keeps_buyer_cancelled_status(env):
+    order, view, token, v = start(env)
+    poid = v["execution"]["provider_order_id"]
+    env.core.handle_provider_cancel(poid)
+    r = env.core.handle_provider_return(poid)  # ORDER_NOT_APPROVED is no news after a cancel
+    assert r["state"] == "EXECUTING" and r["execution"]["provider_status"] == "BUYER_CANCELLED"
+    assert org(env)["reserved_minor"] == 7900
+
+
+def test_cancel_link_with_provider_unreachable_releases_nothing(env):
+    order, view, token, v = start(env)
+    env.sim.inject("get", "timeout")
+    r = env.core.handle_provider_cancel(v["execution"]["provider_order_id"])
+    assert r["state"] == "UNKNOWN" and r["execution"]["failure_reason"] == "CANCEL_UNVERIFIED"
+    assert org(env)["reserved_minor"] == 7900
+    assert env.core.reconcile(view["request_id"])["state"] == "EXECUTING"
+    assert_consistent(env)
+
+
+def test_buyer_abandon_fails_and_releases(env):
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    env.core.handle_provider_cancel(poid)
+    r = env.core.buyer_abandon(poid)
+    assert r["state"] == "FAILED" and r["execution"]["failure_reason"] == "BUYER_CANCELLED"
+    assert env.lab.get_order(order["order_id"])["payment_status"] == "CANCELLED"
+    assert org(env)["reserved_minor"] == 0 and org(env)["settled_minor"] == 0
+    asked = env.core.audit_events(request_id=rid, event_type="CANCEL_REQUESTED")
+    assert len(asked) == 1 and asked[0]["actor"] == "buyer"
+    assert events(env, rid)[-1] == "EXECUTION_FAILED"
+
+    again = env.core.buyer_abandon(poid)  # double submit: no exception, nothing more happens
+    assert again["state"] == "FAILED" and again["execution"]["failure_reason"] == "BUYER_CANCELLED"
+    assert events(env, rid).count("EXECUTION_FAILED") == 1 and events(env, rid).count("CANCEL_REQUESTED") == 1
+    assert_consistent(env)
+
+
+def test_buyer_abandon_finalizes_when_already_captured(env):
+    order, view, token, v = start(env)
+    poid = v["execution"]["provider_order_id"]
+    env.sim.buyer_approve(poid)
+    env.sim.capture_order(poid, f"pact-{view['request_id']}-capture")  # captured at provider, PACT not told
+    r = env.core.buyer_abandon(poid)
+    assert r["state"] == "EXECUTED" and r["execution"]["capture_id"].startswith("SIMCAP-")
+    assert org(env)["settled_minor"] == 7900 and org(env)["reserved_minor"] == 0
+    assert "EXECUTION_FAILED" not in events(env, view["request_id"])
+    assert env.core.buyer_abandon(poid)["state"] == "EXECUTED"
+    assert_consistent(env)
+
+
+def test_buyer_abandon_unverifiable_keeps_reservation(env):
+    order, view, token, v = start(env)
+    env.sim.inject("get", "timeout")
+    with pytest.raises(PactError) as e:
+        env.core.buyer_abandon(v["execution"]["provider_order_id"])
+    assert e.value.code == "CANNOT_VERIFY_PROVIDER"
+    assert env.core.request_detail(view["request_id"])["state"] == "EXECUTING"
+    assert org(env)["reserved_minor"] == 7900
+    with pytest.raises(PactError) as e:
+        env.core.buyer_abandon("SIM-DOESNOTEXIST")
+    assert e.value.code == "PROVIDER_ORDER_UNKNOWN"
+    assert_consistent(env)
+
+
+def test_operator_abandon_still_refuses_terminal_requests(env):
+    order, view, token, v = start(env)
+    env.core.buyer_abandon(v["execution"]["provider_order_id"])
+    with pytest.raises(PactError) as e:
+        env.core.cancel_payment("alice", view["request_id"])
+    assert e.value.code == "NOT_EXECUTING"
+
+
+def test_next_action_after_cancel_and_decline(env, monkeypatch):
+    order, view, token, v = start(env)
+    poid = v["execution"]["provider_order_id"]
+    assert "complete checkout at approval_url" in v["next_action"]
+
+    text = env.core.handle_provider_cancel(poid)["next_action"]
+    assert "backed out of checkout" in text and "nothing was charged" in text
+    assert "retry at the same approval_url" in text
+
+    env.sim.buyer_approve(poid)
+    record_captures(env, monkeypatch, declined())
+    r = env.core.handle_provider_return(poid)
+    assert r["execution"]["provider_status"] == "INSTRUMENT_DECLINED"
+    text = r["next_action"]
+    assert "payment method was declined" in text and "nothing was charged" in text
+    assert "choose another payment method at the same approval_url" in text
+
+
+# ---------------------------------------------------------------------- #41 capture idempotency key
+def test_decline_then_reapprove_captures_with_next_key(env, monkeypatch):
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    env.sim.buyer_approve(poid)
+    keys = record_captures(env, monkeypatch, declined())
+
+    r = env.core.handle_provider_return(poid)
+    assert r["state"] == "EXECUTING" and r["execution"]["provider_status"] == "INSTRUMENT_DECLINED"
+    assert r["execution"]["failure_reason"] is None and r["execution"]["approval_url"]
+    assert org(env)["reserved_minor"] == 7900 and org(env)["settled_minor"] == 0
+
+    # Status polls do not hammer the declined funding source: the buyer has to come back first.
+    s = env.core.get_status(env.agent(), rid)
+    assert s["state"] == "EXECUTING" and s["execution"]["provider_status"] == "INSTRUMENT_DECLINED"
+    assert keys == [f"pact-{rid}-capture"] and "RECONCILED" not in events(env, rid)
+
+    done = env.core.handle_provider_return(poid)  # the buyer chose another funding source and returned
+    assert done["state"] == "EXECUTED" and done["execution"]["provider_order_id"] == poid
+    assert keys == [f"pact-{rid}-capture", f"pact-{rid}-capture-1"]
+    assert all(len(k) <= 108 for k in keys)
+    assert org(env)["settled_minor"] == 7900 and org(env)["reserved_minor"] == 0
+    assert len(env.core.audit_events(event_type="PAYMENT_CAPTURED")) == 1
+    assert_consistent(env)
+
+
+def test_each_decline_advances_the_key_once(env, monkeypatch):
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    env.sim.buyer_approve(poid)
+    keys = record_captures(env, monkeypatch, declined(), declined())
+    for _ in range(3):
+        r = env.core.handle_provider_return(poid)
+    assert r["state"] == "EXECUTED"
+    assert keys == [f"pact-{rid}-capture", f"pact-{rid}-capture-1", f"pact-{rid}-capture-2"]
+    assert_consistent(env)
+
+
+def test_capture_timeout_retry_reuses_the_same_key(env, monkeypatch):
+    """Money safety: after an unknown outcome the retry must carry the same key, so the provider replays the
+    first capture instead of making a second one."""
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    env.sim.buyer_approve(poid)
+    keys = record_captures(env, monkeypatch)
+    env.sim.inject("capture", "timeout", after_side_effect=True)  # captured, but PACT never heard back
+
+    r = env.core.handle_provider_return(poid)
+    assert r["state"] == "UNKNOWN" and r["execution"]["failure_reason"] == "PROVIDER_TIMEOUT_ON_CAPTURE"
+    assert org(env)["reserved_minor"] == 7900
+    # The provider's read side lags behind the capture and still says APPROVED, so PACT captures again.
+    monkeypatch.setattr(env.sim, "get_order", lambda p: ProviderOrder(provider_order_id=p, status="APPROVED"))
+    done = env.core.reconcile(rid)
+    assert done["state"] == "EXECUTED"
+    assert keys == [f"pact-{rid}-capture", f"pact-{rid}-capture"]
+    assert org(env)["settled_minor"] == 7900 and org(env)["reserved_minor"] == 0
+    assert len(env.core.audit_events(event_type="PAYMENT_CAPTURED")) == 1
+    assert_consistent(env)
+
+
+def test_key_does_not_advance_after_timeout_or_not_ready(env, monkeypatch):
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    keys = record_captures(env, monkeypatch)
+    env.core.handle_provider_return(poid)  # ORDER_NOT_APPROVED
+    env.sim.buyer_approve(poid)
+    env.sim.inject("capture", "timeout")  # nothing captured, outcome unknown to PACT
+    assert env.core.handle_provider_return(poid)["state"] == "UNKNOWN"
+    assert env.core.get_status(env.agent(), rid)["state"] == "EXECUTED"
+    assert keys == [f"pact-{rid}-capture"] * 3
+    assert_consistent(env)
+
+
+def test_timeout_after_a_decline_reuses_the_advanced_key(env, monkeypatch):
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    env.sim.buyer_approve(poid)
+    keys = record_captures(env, monkeypatch, declined(), ProviderTimeout("read timed out"))
+    env.core.handle_provider_return(poid)
+    assert env.core.handle_provider_return(poid)["state"] == "UNKNOWN"
+    assert env.core.reconcile(rid)["state"] == "EXECUTED"  # UNKNOWN is resolved by retrying, same key
+    assert keys == [f"pact-{rid}-capture", f"pact-{rid}-capture-1", f"pact-{rid}-capture-1"]
+    assert_consistent(env)
+
+
+# ---------------------------------------------------------------------- #42 polling
+def test_fifty_idle_status_polls_write_nothing_and_call_the_provider_rarely(env, monkeypatch):
+    order, view, token, v = start(env)
+    rid = view["request_id"]
+    calls = count_calls(env, monkeypatch)
+    before = len(env.core.audit_events(limit=500))
+    for _ in range(50):  # 50 polls over 5 seconds
+        s = env.core.get_status(env.agent(), rid)
+        assert s["state"] == "EXECUTING" and s["execution"]["provider_status"] == "PAYER_ACTION_REQUIRED"
+        env.clock.advance(milliseconds=100)
+    assert calls == {"capture_order": 0, "get_order": 3}  # one lookup per 2 seconds
+    assert events(env, rid).count("RECONCILED") == 0
+    assert len(env.core.audit_events(limit=500)) == before
+    assert org(env)["reserved_minor"] == 7900
+    assert_consistent(env)
+
+
+def test_idle_polls_on_a_frozen_clock_still_write_nothing(env):
+    order, view, token, v = start(env)
+    for _ in range(50):
+        env.core.get_status(env.agent(), view["request_id"])
+    assert events(env, view["request_id"]).count("RECONCILED") == 0
+
+
+def test_reconciled_is_audited_once_per_change(env):
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    env.core.handle_provider_return(poid)  # stored status becomes ORDER_NOT_APPROVED
+    for _ in range(5):
+        r = env.core.reconcile(rid)
+    assert r["execution"]["provider_status"] == "PAYER_ACTION_REQUIRED"
+    assert events(env, rid).count("RECONCILED") == 1
+    assert events(env, rid).count("CAPTURE_NOT_COMPLETED") == 1
+
+
+def test_throttle_only_follows_an_idle_lookup(env, monkeypatch):
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    calls = count_calls(env, monkeypatch)
+    env.core.get_status(env.agent(), rid)  # idle lookup
+    env.clock.advance(seconds=1)
+    env.sim.buyer_approve(poid)
+    assert env.core.get_status(env.agent(), rid)["state"] == "EXECUTING"  # inside the interval: stored view
+    assert calls["get_order"] == 1
+    env.core.reconcile(rid)  # admin reconcile is never throttled
+    assert calls["get_order"] == 2 and env.core.get_status(env.agent(), rid)["state"] == "EXECUTED"
+
+
+def test_buyer_return_is_not_throttled(env):
+    order, view, token, v = start(env)
+    poid, rid = v["execution"]["provider_order_id"], view["request_id"]
+    env.core.get_status(env.agent(), rid)
+    env.clock.advance(milliseconds=500)
+    env.sim.buyer_approve(poid)
+    assert env.core.handle_provider_return(poid)["state"] == "EXECUTED"
+    assert env.core.get_status(env.agent(), rid)["state"] == "EXECUTED"
+
+
+def test_poll_after_the_interval_picks_up_the_approval(env):
+    order, view, token, v = start(env)
+    rid = view["request_id"]
+    env.core.get_status(env.agent(), rid)
+    env.clock.advance(seconds=1)
+    env.sim.buyer_approve(v["execution"]["provider_order_id"])
+    env.clock.advance(seconds=1)
+    assert env.core.get_status(env.agent(), rid)["state"] == "EXECUTED"
