@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     paypal_client_secret: SecretStr | None = Field(None, alias="PAYPAL_CLIENT_SECRET")
     paypal_base_url: str = Field("https://api-m.sandbox.paypal.com", alias="PAYPAL_BASE_URL")
     paypal_timeout_seconds: float = Field(15.0, alias="PAYPAL_TIMEOUT_SECONDS")
+    # First page PayPal shows the buyer: its login, the guest card form, or PayPal's own choice.
+    paypal_landing_page: Literal["LOGIN", "GUEST_CHECKOUT", "NO_PREFERENCE"] = Field(
+        "LOGIN", alias="PAYPAL_LANDING_PAGE")
 
     @field_validator("currency")
     @classmethod

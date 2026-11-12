@@ -53,6 +53,7 @@ def test_defaults_are_safe(monkeypatch):
     assert s.paypal_base_url == "https://api-m.sandbox.paypal.com"
     assert s.admin_token is None
     assert s.paypal_client_secret is None
+    assert s.paypal_landing_page == "LOGIN"
 
 
 def test_values_come_from_environment(monkeypatch):
@@ -95,6 +96,7 @@ def test_env_example_template_loads(tmp_path):
     assert s.payment_provider == "simulation"
     assert s.paypal_client_id is None
     assert s.paypal_client_secret is None
+    assert s.paypal_landing_page == "LOGIN"
 
 
 def test_get_settings_is_cached():
@@ -170,6 +172,25 @@ def test_invalid_currency_rejected(monkeypatch, code):
 def test_empty_currency_kwarg_rejected():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, PACT_CURRENCY="")  # type: ignore[call-arg]
+
+
+# --- PayPal landing page --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["LOGIN", "GUEST_CHECKOUT", "NO_PREFERENCE"])
+def test_valid_landing_page(monkeypatch, value):
+    assert load(monkeypatch, PAYPAL_LANDING_PAGE=value).paypal_landing_page == value
+
+
+@pytest.mark.parametrize("value", ["login", "BILLING", "GUEST", "LOGIN ", "0"])
+def test_invalid_landing_page_rejected(monkeypatch, value):
+    with pytest.raises(ValidationError) as exc:
+        load(monkeypatch, PAYPAL_LANDING_PAGE=value)
+    assert "PAYPAL_LANDING_PAGE" in str(exc.value)
+
+
+def test_empty_landing_page_means_default(monkeypatch):
+    assert load(monkeypatch, PAYPAL_LANDING_PAGE="").paypal_landing_page == "LOGIN"
 
 
 # --- PayPal base URL: Sandbox or local only (no real money) ---------------------------------------
