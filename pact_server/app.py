@@ -419,9 +419,12 @@ def _result_page(view: dict) -> HTMLResponse:
     dl = "".join(f"<dt>{html.escape(k)}</dt><dd>{html.escape(str(v))}</dd>" for k, v in rows.items() if v)
     hint = ""
     if ex.get("failure_reason") == "BUYER_CANCELLED" and ex.get("provider") == "paypal":
-        hint = ("<p class='warn'>Checkout was cancelled at PayPal. In PayPal <strong>Sandbox</strong>, log in with your "
-                "<strong>personal</strong> sandbox buyer account (developer.paypal.com → Testing Tools → Sandbox "
-                "Accounts, usually <code>…@personal.example.com</code>), not the business account that receives the "
-                "payment, and click <em>Pay</em>. Ask your agent to start a new purchase to try again.</p>")
+        hint = ("<p class='warn'>Checkout was cancelled at PayPal. In PayPal <strong>Sandbox</strong>, either log in "
+                "with the exact <strong>personal</strong> sandbox account email and password (developer.paypal.com → "
+                "Testing Tools → Sandbox Accounts → <code>sb-…@personal.example.com</code> → View/edit account) — if "
+                "PayPal shows a debit/credit card form after you enter an email, it did not recognise that email — "
+                "or pay on that card form with a test card from Testing Tools → Credit Card Generator (any future "
+                "expiry, any CVV). Never use the business account that receives the payment. Ask your agent to start "
+                "a new purchase to try again.</p>")
     return _page(headline, f"<p class='{cls}'><strong>{html.escape(state)}</strong></p><dl>{dl}</dl>{hint}"
                            "<p>You can close this tab — your agent picks up the result automatically.</p>")
