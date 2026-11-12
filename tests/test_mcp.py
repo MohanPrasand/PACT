@@ -12,7 +12,7 @@ from adapters.simulation.adapter import SimulationAdapter
 from merchant_lab.seed import seed_catalogue
 from pact_core.config import Settings
 from pact_core.seed import seed_agents, seed_policies
-from pact_mcp.server import build_server
+from pact_mcp.server import INSTRUCTIONS, build_server
 from pact_server.app import create_app
 
 ADMIN = "test-admin-token-0123456789abcdef"
@@ -52,6 +52,20 @@ def test_tool_surface_has_no_approval_capability(stack):
     assert names == EXPECTED_TOOLS
     assert not any(word in n for n in names for word in ("approve", "deny", "policy_update", "admin"))
     assert all(len(n) <= 64 and n.replace("_", "").isalnum() for n in names)  # Claude tool-name rules
+
+
+def test_instructions_cover_checkout_retry_and_failure_reasons(stack):
+    # The existing rules keep their numbers; the checkout guidance is appended as rules 8 and 9.
+    for n in range(1, 10):
+        assert f"\n{n}. " in INSTRUCTIONS
+    for phrase in ("BUYER_CANCELLED", "INSTRUMENT_DECLINED", "SAME approval_url", "pact_wait_for_status",
+                   "terminal state (FAILED, EXPIRED, REVOKED, DENIED)", "failure_reason exactly as returned",
+                   "CHECKOUT_TIMEOUT", "CAPTURE_REJECTED:<code>", "PROVIDER_ORDER_NOT_FOUND"):
+        assert phrase in INSTRUCTIONS
+    server, _, _ = stack
+    tools = {t.name: t.description for t in asyncio.run(server.list_tools())}
+    assert "same approval_url" in tools["pact_wait_for_status"] and "failure_reason" in tools["pact_wait_for_status"]
+    assert "same approval_url" in tools["pact_execute_action"]
 
 
 def test_full_purchase_via_mcp_tools(stack):

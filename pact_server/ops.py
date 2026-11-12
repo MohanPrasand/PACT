@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -21,6 +22,7 @@ from pathlib import Path
 import httpx
 
 from pact_core.config import Settings
+from pact_core.ports import CreatePayment, PaymentAdapter, ProviderError, ProviderTimeout
 
 PACT_DIR = Path(".pact")
 LOCK_FILE = PACT_DIR / "server.lock"
@@ -109,6 +111,63 @@ class Check:
     detail: str
     fix: str = ""
     warn_only: bool = False
+    note: str = ""  # extra line shown even when the check passes
+
+
+SANDBOX_GUIDE = "docs/paypal-sandbox-setup.md"
+PAYPAL_ORDER_CHECK = "PayPal Sandbox order"
+BUYER_HINT = ("buyers must log in at PayPal with a different, personal Sandbox account "
+              f"(never this business account); see {SANDBOX_GUIDE}")
+DOCTOR_ORDER_AMOUNT_MINOR = 100
+
+# Provider codes seen when creating an order, with what the operator should do about each.
+_ORDER_FIXES = {
+    "CURRENCY_NOT_SUPPORTED": "set PACT_CURRENCY=USD in .env (the Sandbox business account cannot accept this currency)",
+    "PAYEE_ACCOUNT_RESTRICTED": f"the Sandbox business account is restricted; create a new business account ({SANDBOX_GUIDE})",
+    "PAYEE_ACCOUNT_LOCKED_OR_CLOSED": f"the Sandbox business account is closed; create a new business account ({SANDBOX_GUIDE})",
+    "PAYEE_NOT_ENABLED_FOR_CARD_PROCESSING": f"the business account cannot take direct card payments; pay with a personal "
+                                             f"Sandbox account instead ({SANDBOX_GUIDE})",
+    "NOT_AUTHORIZED": "the REST app is not allowed to create orders; check the app's features in the PayPal developer dashboard",
+    "PERMISSION_DENIED": "the REST app is not allowed to create orders; check the app's features in the PayPal developer dashboard",
+    "RATE_LIMIT_REACHED": "PayPal is rate limiting; wait a minute and run `pact doctor` again",
+}
+
+
+def describe_payee(raw: dict | None) -> str | None:
+    """The receiving business account from ``ProviderOrder.raw["payee"]``, or None when PayPal did not return it.
+
+    Only the non-secret email address and merchant id are shown."""
+    payee = (raw or {}).get("payee")
+    if not isinstance(payee, dict):
+        return None
+    email, merchant_id = payee.get("email_address"), payee.get("merchant_id")
+    parts = []
+    if isinstance(email, str) and email:
+        parts.append(email[:127])
+    if isinstance(merchant_id, str) and merchant_id:
+        parts.append(f"merchant id {merchant_id[:64]}")
+    return ", ".join(parts) or None
+
+
+def paypal_order_check(adapter: PaymentAdapter, settings: Settings) -> Check:
+    """Create one small, never-approved Sandbox order to prove the business account can be paid in PACT_CURRENCY."""
+    ref = "doc_" + secrets.token_hex(6)
+    try:
+        order = adapter.create_order(CreatePayment(
+            reference_id=ref, merchant_order_id=ref, amount_minor=DOCTOR_ORDER_AMOUNT_MINOR, currency=settings.currency,
+            description="PACT doctor check (not a purchase)", return_url=f"{settings.public_url}/payments/return",
+            cancel_url=f"{settings.public_url}/payments/cancel", idempotency_key=f"pact-{ref}-create"))
+    except ProviderError as exc:
+        fix = _ORDER_FIXES.get(exc.code) or (
+            "PayPal is temporarily refusing requests; run `pact doctor` again" if exc.retryable
+            else f"PayPal refused a test order in {settings.currency}; see {SANDBOX_GUIDE}")
+        return Check(PAYPAL_ORDER_CHECK, False, exc.code, fix)
+    except ProviderTimeout:
+        return Check(PAYPAL_ORDER_CHECK, False, "no clear answer from PayPal (timeout or server error)",
+                     "run `pact doctor` again; if it keeps failing, check your network and https://www.paypal-status.com")
+    payee = describe_payee(order.raw)
+    note = f"money is received by {payee}; {BUYER_HINT}" if payee else BUYER_HINT
+    return Check(PAYPAL_ORDER_CHECK, True, f"created in {settings.currency}, status {order.status}", note=note)
 
 
 def mcp_registered(cwd: Path | None = None) -> bool | None:
@@ -123,7 +182,9 @@ def mcp_registered(cwd: Path | None = None) -> bool | None:
 
 
 def run_doctor(settings: Settings, *, env_file: Path = Path(".env"), check_mcp: bool = True,
-               http: httpx.Client | None = None, shopper_dir: Path | None = None) -> list[Check]:
+               http: httpx.Client | None = None, shopper_dir: Path | None = None,
+               paypal_transport: httpx.BaseTransport | None = None, check_order: bool = True) -> list[Check]:
+    """``paypal_transport`` lets tests stand in for PayPal. ``check_order=False`` skips the test order."""
     checks: list[Check] = []
     checks.append(Check(".env file", env_file.exists(), str(env_file) if env_file.exists() else "missing",
                         "cp .env.example .env"))
@@ -133,15 +194,21 @@ def run_doctor(settings: Settings, *, env_file: Path = Path(".env"), check_mcp: 
     # Payment provider
     if settings.payment_provider == "paypal":
         from adapters.paypal.adapter import PayPalAdapter
-        from pact_core.ports import ProviderError, ProviderTimeout
 
+        adapter = None
         try:
-            PayPalAdapter(settings.paypal_client_id or "", settings.paypal_client_secret,
-                          base_url=settings.paypal_base_url, timeout=15).verify_credentials()
+            adapter = PayPalAdapter(settings.paypal_client_id or "", settings.paypal_client_secret,
+                                    base_url=settings.paypal_base_url, timeout=15, transport=paypal_transport)
+            adapter.verify_credentials()
             checks.append(Check("PayPal Sandbox credentials", True, "OAuth OK"))
+            if check_order:
+                checks.append(paypal_order_check(adapter, settings))
         except (ProviderError, ProviderTimeout, ValueError) as exc:
             checks.append(Check("PayPal Sandbox credentials", False, getattr(exc, "code", type(exc).__name__),
                                 "check PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET (Sandbox app) in .env"))
+        finally:
+            if adapter is not None:
+                adapter.close()
     else:
         checks.append(Check("Payment provider", True, "simulation (payments are NOT PayPal)",
                             "set PACT_PAYMENT_PROVIDER=paypal for the real PayPal Sandbox demo", warn_only=True))
@@ -206,6 +273,8 @@ def format_checks(checks: list[Check]) -> tuple[str, bool]:
             lines.append(f"   → {c.fix}")
         elif c.ok and c.warn_only and c.fix:
             lines.append(f"   → {c.fix}")
+        if c.note:
+            lines.append(f"   · {c.note}")
     return "\n".join(lines), healthy
 
 
@@ -268,8 +337,9 @@ class ApprovalClient:
         return self._json(self.http.post(f"/admin/authorizations/{request_id}/approve",
                                          json={"request_hash": request_hash, "note": note}))
 
-    def cancel(self, request_id: str) -> dict:
-        return self._json(self.http.post(f"/admin/authorizations/{request_id}/cancel"))
+    def cancel(self, request_id: str, *, force: bool = False) -> dict:
+        return self._json(self.http.post(f"/admin/authorizations/{request_id}/cancel",
+                                         params={"force": "true"} if force else None))
 
     def stuck(self) -> list[dict]:
         out = []

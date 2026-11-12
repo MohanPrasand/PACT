@@ -3,7 +3,8 @@
     uv run python examples/paypal_sandbox_check.py [--currency USD] [--capture ORDER_ID]
 
 1. Obtains an OAuth access token (client credentials).
-2. Creates a small CAPTURE order and prints the buyer approval URL.
+2. Creates a small CAPTURE order and prints the buyer approval URL and, when PayPal returns it, the
+   business account that receives the money (buyers must pay with a different, personal account).
 3. With --capture ORDER_ID: captures an order you approved in the browser with a sandbox
    personal account, and prints the capture result. The capture uses the deterministic
    idempotency key ``pact-check-capture-<ORDER_ID>``, so re-running it replays the same capture
@@ -27,6 +28,7 @@ from adapters.paypal.adapter import PayPalAdapter  # noqa: E402
 from pact_core.config import get_settings  # noqa: E402
 from pact_core.money import to_decimal_str  # noqa: E402
 from pact_core.ports import CreatePayment, ProviderError, ProviderTimeout  # noqa: E402
+from pact_server.ops import BUYER_HINT, describe_payee  # noqa: E402
 
 
 def capture_check_key(order_id: str) -> str:
@@ -79,6 +81,10 @@ def main() -> int:
         ))
         print(f"OK   Order created in {currency} {to_decimal_str(args.amount_minor)}: id={o.provider_order_id} status={o.status}")
         print(f"     Buyer approval URL: {o.approval_url}")
+        payee = describe_payee(o.raw)
+        if payee:
+            print(f"     Receiving business account: {payee}")
+        print(f"     Note: {BUYER_HINT}")
         again = adapter.get_order(o.provider_order_id)
         print(f"OK   Order retrieval: status={again.status}")
     except ProviderError as e:

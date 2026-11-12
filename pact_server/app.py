@@ -6,6 +6,10 @@ Auth:
     that can approve, deny, revoke for others, reconcile or change policy. Agent keys get 403 there.
   * Merchant Lab (/merchant) and the browser redirects (/payments, /sim) are unauthenticated: they are a
     sandbox commerce simulator and provider callbacks that can only act on already-authorized payments.
+    ``GET /payments/cancel`` never ends a payment. ``POST /payments/abandon`` (the buyer's "Cancel this
+    payment" button) is unauthenticated too, which is acceptable because it only acts on a payment
+    identified by its provider order id, runs the provider-checked path (a payment the provider already
+    captured is recorded as executed, not cancelled) and can only release a reservation, never move money.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ import html
 import logging
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -107,7 +112,8 @@ def build_adapters(settings: Settings, public_url: str) -> dict[str, PaymentAdap
 
         return {"paypal": PayPalAdapter(settings.paypal_client_id or "", settings.paypal_client_secret,
                                         base_url=settings.paypal_base_url,
-                                        timeout=settings.paypal_timeout_seconds)}
+                                        timeout=settings.paypal_timeout_seconds,
+                                        landing_page=settings.paypal_landing_page)}
     return {"simulation": SimulationAdapter(public_url)}
 
 
@@ -121,7 +127,8 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
     lab = MerchantLab(db)
     core = PactCore(db, MerchantLabOrderSource(lab), adapters, provider=provider, currency=settings.currency,
                     public_url=settings.public_url, grant_ttl_seconds=settings.grant_ttl_seconds,
-                    approval_ttl_seconds=settings.approval_ttl_seconds, clock=clock)
+                    approval_ttl_seconds=settings.approval_ttl_seconds,
+                    checkout_ttl_seconds=settings.checkout_ttl_seconds, clock=clock)
     admin_token = settings.admin_token.get_secret_value() if settings.admin_token else None
     sim = adapters.get("simulation")
 
@@ -311,8 +318,9 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
         return core.admin_revoke(admin, request_id)
 
     @app.post("/admin/authorizations/{request_id}/cancel", tags=["admin"])
-    def cancel_payment(request_id: str, admin: str = Depends(admin_auth)):
-        return core.cancel_payment(admin, request_id)
+    def cancel_payment(request_id: str, force: bool = False, admin: str = Depends(admin_auth)):
+        """``force=true`` closes a payment PACT cannot verify, without provider evidence (audited)."""
+        return core.cancel_payment(admin, request_id, force=force)
 
     @app.post("/admin/authorizations/{request_id}/reconcile", tags=["admin"])
     def reconcile(request_id: str, _admin: str = Depends(admin_auth)):
@@ -355,9 +363,20 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
     @app.get("/payments/cancel", tags=["payments"], response_class=HTMLResponse)
     def payment_cancel(token: str = Query(..., max_length=64)):
         try:
-            view = core.handle_provider_cancel(token)
+            view = core.handle_provider_cancel(token)  # non-terminal: a GET never ends a payment
         except PactError as exc:
             return _page("Payment not found", f"<p>{html.escape(exc.message)}</p>", status=404)
+        return _result_page(view)
+
+    @app.post("/payments/abandon", tags=["payments"], response_class=HTMLResponse)
+    async def payment_abandon(request: Request):
+        """The buyer's explicit "Cancel this payment". Form field ``token`` = provider order id."""
+        token = await _form_token(request)
+        try:
+            view = await run_in_threadpool(core.buyer_abandon, token)
+        except PactError as exc:
+            title = "Payment not found" if exc.status_code == 404 else "Payment could not be cancelled"
+            return _page(title, f"<p>{html.escape(exc.message)}</p>", status=exc.status_code)
         return _result_page(view)
 
     # ------------------------------------------------------------------ simulated checkout (simulation only)
@@ -391,10 +410,8 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
             o = sim.lookup(order_id)
             if o is None:
                 return _page("Unknown checkout", "<p>No such simulated order.</p>", status=404)
-            try:
-                sim.buyer_cancel(order_id)
-            except Exception as exc:
-                return _page("Cannot cancel", f"<p>{html.escape(str(exc))}</p>", status=409)
+            # Like PayPal's "cancel and return" link: the buyer just leaves. The order is not voided, so
+            # "Try again" on the cancel page still leads to a payable checkout.
             return RedirectResponse(f"{o.cancel_url}?token={order_id}", status_code=303)
 
     # ------------------------------------------------------------------ dashboard (built SPA) or index
@@ -414,7 +431,7 @@ _STYLE = """body{font-family:system-ui,sans-serif;max-width:560px;margin:48px au
 h1{font-size:1.4rem}.warn{background:#fff4ce;border:1px solid #e6c200;padding:8px 12px;border-radius:6px}
 .ok{color:#0a7a32}.bad{color:#b42318}code{background:#f3f4f6;padding:1px 4px;border-radius:4px}
 button{font-size:1rem;padding:10px 18px;margin:8px 8px 0 0;border-radius:6px;border:0;background:#1f6feb;color:#fff;cursor:pointer}
-button.alt{background:#6b7280}dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}dt{color:#6b7280}"""
+button.alt{background:#6b7280}a.btn{display:inline-block;padding:10px 18px;margin:8px 8px 0 0;border-radius:6px;background:#1f6feb;color:#fff;text-decoration:none}dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}dt{color:#6b7280}"""
 
 
 def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
@@ -424,24 +441,96 @@ def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
                         status_code=status)
 
 
+TOKEN_MAX_LENGTH = 64  # same limit as the ?token= query parameter on the provider redirects
+_FORM_MAX_BYTES = 1024
+
+
+async def _form_token(request: Request) -> str:
+    """Read the ``token`` field of a small urlencoded form body (no multipart dependency needed)."""
+    def invalid(msg: str) -> RequestValidationError:
+        return RequestValidationError([{"loc": ("body", "token"), "msg": msg, "type": "value_error"}])
+
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > _FORM_MAX_BYTES:
+        raise invalid("Form body too large")
+    raw = b""
+    async for chunk in request.stream():  # stop reading as soon as the limit is passed (chunked uploads too)
+        raw += chunk
+        if len(raw) > _FORM_MAX_BYTES:
+            raise invalid("Form body too large")
+    try:
+        values = parse_qs(raw.decode("utf-8"), keep_blank_values=True, max_num_fields=8).get("token", [])
+    except ValueError:  # not UTF-8, or too many fields
+        raise invalid("Malformed form body") from None
+    if len(values) != 1 or not values[0]:
+        raise invalid("Field required")
+    if len(values[0]) > TOKEN_MAX_LENGTH:
+        raise invalid(f"String should have at most {TOKEN_MAX_LENGTH} characters")
+    return values[0]
+
+
+def _checkout_link(ex: dict, label: str) -> str:
+    """A link back to the provider checkout. The URL only ever comes from the stored view and must be an
+    absolute http(s) URL; anything else (missing, ``javascript:``, …) renders no link at all."""
+    url = ex.get("approval_url")
+    if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+        return ""
+    return f"<p><a class='btn' href=\"{html.escape(url, quote=True)}\">{html.escape(label)}</a></p>"
+
+
+def _sandbox_hint(*, payment_open: bool) -> str:
+    retry = "" if payment_open else " Ask your agent to start a new purchase to try again."
+    return ("<p class='warn'>Checkout was cancelled at PayPal. In PayPal <strong>Sandbox</strong>, either log in "
+            "with the exact <strong>personal</strong> sandbox account email and password (developer.paypal.com → "
+            "Testing Tools → Sandbox Accounts → <code>sb-…@personal.example.com</code> → View/edit account) — if "
+            "PayPal shows a debit/credit card form after you enter an email, it did not recognise that email — "
+            "or pay on that card form with a test card from Testing Tools → Credit Card Generator (any future "
+            f"expiry, any CVV). Never use the business account that receives the payment.{retry} "
+            "See <code>docs/paypal-sandbox-setup.md</code>.</p>")
+
+
 def _result_page(view: dict) -> HTMLResponse:
     state = view["state"]
     ex = view["execution"]
+    reason = ex.get("failure_reason") or ""
+    is_paypal = ex.get("provider") == "paypal"
+    open_status = ex.get("provider_status") if state == "EXECUTING" else None
     headline = {"EXECUTED": "Payment complete", "FAILED": "Payment not completed",
                 "UNKNOWN": "Payment being verified"}.get(state, "Payment in progress")
     cls = "ok" if state == "EXECUTED" else ("bad" if state == "FAILED" else "")
     rows = {"Status": state, "Provider": ex.get("provider_label"), "Amount": f"{view['amount']} {view['currency']}",
             "Order": view["order_id"], "Authorization": view["request_id"],
-            "Capture id": ex.get("capture_id"), "Reason": ex.get("failure_reason")}
+            "Capture id": ex.get("capture_id"), "Reason": reason}
     dl = "".join(f"<dt>{html.escape(k)}</dt><dd>{html.escape(str(v))}</dd>" for k, v in rows.items() if v)
-    hint = ""
-    if ex.get("failure_reason") == "BUYER_CANCELLED" and ex.get("provider") == "paypal":
-        hint = ("<p class='warn'>Checkout was cancelled at PayPal. In PayPal <strong>Sandbox</strong>, either log in "
-                "with the exact <strong>personal</strong> sandbox account email and password (developer.paypal.com → "
-                "Testing Tools → Sandbox Accounts → <code>sb-…@personal.example.com</code> → View/edit account) — if "
-                "PayPal shows a debit/credit card form after you enter an email, it did not recognise that email — "
-                "or pay on that card form with a test card from Testing Tools → Credit Card Generator (any future "
-                "expiry, any CVV). Never use the business account that receives the payment. Ask your agent to start "
-                "a new purchase to try again.</p>")
-    return _page(headline, f"<p class='{cls}'><strong>{html.escape(state)}</strong></p><dl>{dl}</dl>{hint}"
-                           "<p>You can close this tab — your agent picks up the result automatically.</p>")
+    note, actions, hint = "", "", ""
+    closing = "<p>You can close this tab — your agent picks up the result automatically.</p>"
+
+    if open_status == "BUYER_CANCELLED":  # buyer left the checkout; the payment is still open and payable
+        headline = "Checkout cancelled"
+        note = "<p>Nothing was charged. The payment is still open — you can try again or cancel it.</p>"
+        token = html.escape(str(ex.get("provider_order_id") or ""), quote=True)
+        actions = (_checkout_link(ex, "Try again")
+                   + "<form method='post' action='/payments/abandon'>"
+                     f"<input type='hidden' name='token' value=\"{token}\">"
+                     "<button class='alt'>Cancel this payment</button></form>")
+        hint = _sandbox_hint(payment_open=True) if is_paypal else ""
+        closing = "<p>If you do nothing, the payment stays open until it is completed, cancelled or times out.</p>"
+    elif open_status == "INSTRUMENT_DECLINED":
+        headline = "Payment method declined"
+        note = ("<p>PayPal declined the payment method. Nothing was charged. The payment is still open — "
+                "go back to the checkout and choose another payment method.</p>")
+        actions = _checkout_link(ex, "Choose another payment method")
+        closing = "<p>If you do nothing, the payment stays open until it is completed, cancelled or times out.</p>"
+    elif reason.startswith("CAPTURE_REJECTED:"):
+        code = html.escape(reason.split(":", 1)[1])
+        note = (f"<p>PayPal refused the payment and no money moved. Provider code: <code>{code}</code>.</p>")
+    elif reason == "CHECKOUT_TIMEOUT":
+        note = "<p>The checkout was not completed in time. Nothing was charged.</p>"
+    elif reason == "PROVIDER_ORDER_NOT_FOUND":
+        note = "<p>The PayPal order expired before it was paid. Nothing was charged.</p>"
+    elif reason == "BUYER_CANCELLED":
+        note = "<p>The payment was cancelled. Nothing was charged.</p>"
+        hint = _sandbox_hint(payment_open=False) if is_paypal else ""
+
+    return _page(headline, f"<p class='{cls}'><strong>{html.escape(state)}</strong></p>{note}<dl>{dl}</dl>"
+                           f"{actions}{hint}{closing}")

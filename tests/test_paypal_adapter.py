@@ -351,6 +351,51 @@ def test_create_order_request_shape(adapter, fake):
     assert ctx["user_action"] == "PAY_NOW"
     assert ctx["shipping_preference"] == "NO_SHIPPING"
     assert ctx["brand_name"] == "PACT Merchant Lab"
+    assert ctx["landing_page"] == "LOGIN"
+
+
+@pytest.mark.parametrize("landing_page", ["LOGIN", "GUEST_CHECKOUT", "NO_PREFERENCE"])
+def test_create_order_sends_configured_landing_page(fake, clock, landing_page):
+    fake.handlers[("POST", "/v2/checkout/orders")] = httpx.Response(201, json=_created_body())
+    a = PayPalAdapter(CLIENT_ID, CLIENT_SECRET, landing_page=landing_page, transport=httpx.MockTransport(fake),
+                      clock=clock)
+    try:
+        a.create_order(_req())
+    finally:
+        a.close()
+    ctx = json.loads(fake.api_requests()[0].content)["payment_source"]["paypal"]["experience_context"]
+    assert ctx["landing_page"] == landing_page
+
+
+@pytest.mark.parametrize("landing_page", ["login", "BILLING", "", None, "LOGIN ", ["LOGIN"]])
+def test_invalid_landing_page_rejected(landing_page):
+    with pytest.raises(ValueError) as exc:
+        PayPalAdapter(CLIENT_ID, CLIENT_SECRET, landing_page=landing_page)
+    assert "landing_page" in str(exc.value)
+    assert CLIENT_SECRET not in str(exc.value)
+
+
+@pytest.mark.parametrize("env,expected", [({}, "LOGIN"), ({"PAYPAL_LANDING_PAGE": "GUEST_CHECKOUT"},
+                                                          "GUEST_CHECKOUT")])
+def test_build_adapters_passes_landing_page_setting(monkeypatch, fake, env, expected):
+    from pact_server.app import build_adapters
+
+    for name in list(os.environ):
+        if name.startswith(("PACT_", "PAYPAL_")):
+            monkeypatch.delenv(name)
+    settings = Settings(_env_file=None, PACT_PAYMENT_PROVIDER="paypal", PAYPAL_CLIENT_ID=CLIENT_ID,
+                        PAYPAL_CLIENT_SECRET=CLIENT_SECRET, **env)
+    paypal = build_adapters(settings, "http://localhost:8000")["paypal"]
+    # Swap in the fake PayPal transport so the request body can be observed without any network.
+    paypal._http.close()
+    paypal._http = httpx.Client(base_url=SANDBOX_BASE_URL, transport=httpx.MockTransport(fake))
+    fake.handlers[("POST", "/v2/checkout/orders")] = httpx.Response(201, json=_created_body())
+    try:
+        paypal.create_order(_req())
+    finally:
+        paypal.close()
+    ctx = json.loads(fake.api_requests()[0].content)["payment_source"]["paypal"]["experience_context"]
+    assert ctx["landing_page"] == expected
 
 
 @pytest.mark.parametrize("minor,value", [(1, "0.01"), (100, "1.00"), (4200, "42.00"), (123456789, "1234567.89")])
@@ -379,6 +424,37 @@ def test_create_order_parses_payer_action_url(adapter, fake):
     assert o.capture_id is None and o.captured_amount_minor is None
     assert o.raw["reference_id"] == "req_abc123" and o.raw["provider"] == "paypal"
     assert o.raw["amount"] == {"currency_code": "USD", "value": "42.00"}
+
+
+def test_payee_business_account_parsed_into_raw(adapter, fake):
+    body = _created_body()
+    body["purchase_units"][0]["payee"] = {"merchant_id": "MERCHANT123ABC", "email_address": "biz@example.com",
+                                          "display_data": {"brand_name": "ignored"}}
+    fake.handlers[("POST", "/v2/checkout/orders")] = httpx.Response(201, json=body)
+    o = adapter.create_order(_req())
+    assert o.raw["payee"] == {"merchant_id": "MERCHANT123ABC", "email_address": "biz@example.com"}
+    _assert_no_secrets(json.dumps(o.raw))
+
+
+def test_payee_parsed_on_get_order_without_payer_data(adapter, fake):
+    body = _captured_body()
+    body["purchase_units"][0]["payee"] = {"merchant_id": "MERCHANT123ABC"}
+    fake.handlers[("GET", f"/v2/checkout/orders/{ORDER_ID}")] = httpx.Response(200, json=body)
+    o = adapter.get_order(ORDER_ID)
+    assert o.raw["payee"] == {"merchant_id": "MERCHANT123ABC"}
+    assert "payer" not in o.raw and "buyer@example.com" not in json.dumps(o.raw)
+
+
+@pytest.mark.parametrize("payee", [None, {}, "MERCHANT123ABC", ["x"], {"merchant_id": 123, "email_address": None},
+                                   {"merchant_id": "", "display_data": {"brand_name": "x"}}])
+def test_payee_absent_or_malformed_is_not_in_raw(adapter, fake, payee):
+    body = _created_body()
+    if payee is not None:
+        body["purchase_units"][0]["payee"] = payee
+    fake.handlers[("POST", "/v2/checkout/orders")] = httpx.Response(201, json=body)
+    o = adapter.create_order(_req())
+    assert "payee" not in o.raw
+    assert o.provider_order_id == ORDER_ID
 
 
 def test_approve_link_used_when_no_payer_action(adapter, fake):

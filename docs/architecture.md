@@ -104,7 +104,109 @@ Reason codes and rule fields: [`specification/policies/README.md`](../specificat
 - **Export:** `to_dict()` emits the exact hashed timestamp string, so exported events can be re-verified outside PACT.
 - **Known limitation:** deleting the last event and also rolling back the head can't be detected from inside the database. Record `head_hash` somewhere external to detect truncation.
 
-## 8. Planned components
+## 8. Checkout lifecycle after execution starts
+
+`pact_core/gateway.py` is the only code that calls a payment adapter. `execute()` consumes the grant, moves the request `GRANTED → EXECUTING` in one transaction and creates the provider order outside it. From then on the buyer is on the provider's checkout page and the request holds its budget reservation until one of the paths below ends it.
+
+All of this is implemented on the `fix/paypal-gateway` branch (#38–#42). Run against the live PayPal Sandbox so far: order creation, early return, cancel link, explicit cancel, polling, order-not-found and checkout timeout. Buyer approval, capture, decline and the unknown-outcome paths are tested with the simulation adapter and a mocked PayPal API only.
+
+### Paths
+
+| Event | What the gateway does | Request afterwards | Budget reservation |
+|---|---|---|---|
+| Buyer approves and returns (`GET /payments/return`) | Captures with key `pact-<request>-capture`, then checks captured amount and currency against the authorization | `EXECUTED` | settled |
+| Capture is still pending at the provider | Notes `CAPTURE_PENDING`; a later poll looks again | `EXECUTING` | held |
+| Order is not approved yet (`ORDER_NOT_APPROVED`, `PAYER_ACTION_REQUIRED`) | Notes the status | `EXECUTING` | held |
+| Buyer uses the cancel link (`GET /payments/cancel`) | Asks the provider for the order. A completed order is finalized. Otherwise sets `provider_status = BUYER_CANCELLED` and audits `CHECKOUT_CANCELLED_BY_BUYER` once. The buyer can retry at the same `approval_url` | `EXECUTING` | held |
+| Buyer cancels explicitly (`POST /payments/abandon`) | Asks the provider first; a completed order is finalized instead | `FAILED / BUYER_CANCELLED` | released |
+| Operator runs `pact cancel` | Same provider check. If the provider cannot be asked, the call is refused (`CANNOT_VERIFY_PROVIDER`) and nothing changes | `FAILED / ABANDONED_CHECKOUT` | released |
+| Payment method declined (`INSTRUMENT_DECLINED`) | Sets `provider_status = INSTRUMENT_DECLINED`. The buyer returns to the same `approval_url` and picks another method; the next capture uses the next idempotency key | `EXECUTING` | held |
+| Provider rejects the capture with any other error | Looks at the order once (see below) | `FAILED / CAPTURE_REJECTED:<code>` | released |
+| Capture response reports the capture as `DECLINED` or `FAILED` | Fails the request | `FAILED / CAPTURE_DECLINED` or `CAPTURE_FAILED` | released |
+| Provider says the order does not exist (`RESOURCE_NOT_FOUND`, PayPal's 404 `INVALID_RESOURCE_ID`) | No order means no capture, so the request fails. Exception: a capture call with an unknown outcome (see below) | `FAILED / PROVIDER_ORDER_NOT_FOUND` | released |
+| Provider reports the order `VOIDED` | Fails the request | `FAILED / PROVIDER_ORDER_VOIDED` | released |
+| Checkout older than `PACT_CHECKOUT_TTL_SECONDS` | The sweeper asks the provider. A completed order is finalized and an approved one is captured; otherwise it audits `CHECKOUT_TIMED_OUT` and fails the request | `FAILED / CHECKOUT_TIMEOUT` | released |
+| Captured amount or currency differs from the authorization | Audits `CAPTURE_MISMATCH` and holds the request for manual review | `UNKNOWN / CAPTURE_AMOUNT_MISMATCH` | held |
+| Create or capture call times out, or the capture status is unclear | See "Unknown outcomes" | `UNKNOWN` | held |
+
+### Cancel and decline are not terminal
+
+- **Cancel link:** PayPal sends the buyer to the cancel URL with an unauthenticated GET, and the order stays payable. So the GET only records `BUYER_CANCELLED` on a request that stays `EXECUTING`. Ending the payment needs the explicit POST, which runs the provider-checked path.
+- **Decline:** `INSTRUMENT_DECLINED` means the buyer has to choose another funding source for the same order. The request stays `EXECUTING`.
+- **Status is kept:** while the provider still reports `PAYER_ACTION_REQUIRED`, reconciliation does not overwrite a `BUYER_CANCELLED` or `INSTRUMENT_DECLINED` status. It is cleared when the order becomes `APPROVED`.
+- **Agents:** the MCP instructions tell the agent to hand out the same `approval_url` again and keep waiting, and not to start a new purchase or authorization unless the request is terminal.
+
+### Capture idempotency key
+
+- The first capture uses `pact-<request>-capture`. After each definitive `INSTRUMENT_DECLINED` the key advances to `pact-<request>-capture-<n>`, where `n` is the number of such declines in the audit log. Without this, a provider that replays the stored response for a reused key would return the old decline forever.
+- The key never advances after a timeout. A capture with an unknown outcome is repeated, if at all, with the same key, so the provider cannot capture twice.
+
+### Capture rejected
+
+A capture error that is neither "not approved yet" nor a decline goes to `_after_capture_rejected`, which calls `get_order` exactly once and never captures again from there:
+
+- **Order completed or has a capture** (for example `ORDER_ALREADY_CAPTURED`): finalize as a normal capture.
+- **Lookup fails:** note the error code and stay `EXECUTING`; the next poll tries again.
+- **Retryable error** (rate limit, transient auth): stay `EXECUTING`.
+- **Otherwise:** `FAILED / CAPTURE_REJECTED:<provider code>`.
+
+`_capture` never calls reconciliation, and reconciliation calls `_capture` at most once, so there is no retry loop.
+
+### Checkout timeout
+
+- **When:** the expiry sweeper (`PACT_EXPIRY_SWEEP_SECONDS`) picks up `EXECUTING` requests whose grant was consumed more than `PACT_CHECKOUT_TTL_SECONDS` ago (default 3600; `0` disables).
+- **Provider first:** it runs the same provider-checked path as an explicit cancel, with the provider call outside the database transaction. A payment the buyer completed in the meantime is finalized, not failed.
+- **Left alone:** `UNKNOWN` requests are never timed out. If the provider cannot be reached, the request waits for the next sweep.
+
+### Unknown outcomes and reconciliation
+
+- **Entering `UNKNOWN`:** a timeout, 5xx or dropped connection on create or capture, an unclear capture status, or an amount mismatch. The request keeps its reservation.
+- **Leaving it:** only through `reconcile()`, which asks the provider what happened. An unknown create is retried with the same idempotency key, so the provider returns the original order. A completed order is finalized, an approved one is captured, and one still waiting for the buyer goes back to `EXECUTING`.
+- **Order not found while a capture is in doubt:** the two answers conflict, so the request is held and the 404 is audited once (see "Capture in doubt").
+- **Polling:** a status read of a live request triggers reconciliation. Provider lookups are limited to one per request every 2 seconds (inside that interval the stored view is returned), and a `RECONCILED` audit event is written only when the provider status, capture status or request state changed.
+
+### Capture in doubt
+
+This is the rule the rest of the section depends on. A request is *in doubt* when money may have moved or may be about to:
+
+| Marker | Set when |
+|---|---|
+| `failure_reason = CAPTURE_IN_PROGRESS` | Committed to the database before every capture call, cleared by that call's answer |
+| `failure_reason = PROVIDER_TIMEOUT_ON_CAPTURE` | A capture call timed out, returned 5xx or dropped |
+| `failure_reason = CAPTURE_AMOUNT_MISMATCH` / `CAPTURE_STATUS_UNCLEAR` | The provider showed a capture PACT could not settle |
+| `provider_status = CAPTURE_PENDING` | The provider reports the capture as pending |
+
+While a request is in doubt:
+
+- **Nothing releases the reservation on indirect evidence.** An order lookup can lag behind a capture, so "still approved", "not approved", "order not found", a buyer or operator cancel and the checkout timeout all leave the request as it is. `_fail()` checks this itself, in the same transaction as the release, so a cancel cannot overtake a capture that has already been sent.
+- **Only the capture's own answer decides.** An open capture call is repeated with the same idempotency key (by a status poll, `reconcile`, or a cancel attempt). The provider then answers for that call: captured (finalize), or definitively not (`ORDER_NOT_APPROVED`, a decline, a rejection), which clears the marker and returns an `UNKNOWN` request to `EXECUTING`.
+- **Cancel attempts are refused** with `CANNOT_VERIFY_PROVIDER` if that does not settle it.
+- **Manual exit:** `pact cancel <id> --force` (admin API `?force=true`) closes a payment PACT cannot verify, for example when the provider no longer answers for the order. It releases the reservation without provider evidence, so the operator must check the PayPal account first. It is audited as `CANCEL_FORCED` and is refused while a capture call is in flight.
+
+### Polls after a decline
+
+A status poll does not retry a declined capture immediately, because the order usually still carries the declined funding source. The buyer's return always retries. If the buyer chose another source and never came back, polls retry by themselves at most 3 times, at least 60 seconds apart; after that the checkout timeout makes one last attempt.
+
+### Cancel link while the provider is unreachable
+
+Nothing was learned, so nothing changes: the request stays `EXECUTING` and no audit event is written.
+
+### Budget release
+
+A reservation is released in exactly one place, `_fail()`, in the same transaction as the move to `FAILED`. It is settled in exactly one place, `_finalize()`, after the captured amount and currency have been checked. `_fail()` refuses to act on a request that is in doubt unless the caller holds the provider's own verdict on the capture.
+
+| Path to `FAILED` | Evidence that no money moved |
+|---|---|
+| Explicit cancel, operator cancel, checkout timeout | No capture is in doubt, and `get_order` shows no capture or the provider says the order does not exist |
+| Order not found | The provider has no such order, and no capture is in doubt |
+| Capture rejected | The provider refused the capture with a non-retryable error, and a following `get_order` shows no capture |
+| Capture `DECLINED` / `FAILED` | The provider reports that verdict on the capture itself |
+| Order `VOIDED` | The provider reports that state, and no capture is in doubt |
+| `pact cancel --force` | None from the provider: an operator's audited decision |
+
+When that evidence is missing, nothing is released: the request stays `EXECUTING` or `UNKNOWN`, both of which are reserving states (section 5).
+
+## 9. Planned components
 
 | Component | Design summary | Issue |
 |---|---|---|

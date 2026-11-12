@@ -1,7 +1,8 @@
 """``pact`` command-line interface.
 
     pact demo                 one command: check config, seed, set up the shopper workspace + MCP, serve
-    pact doctor               diagnose configuration, PayPal credentials, server and MCP registration
+    pact doctor               diagnose configuration, PayPal credentials (creates one small unpaid Sandbox
+                              test order), server and MCP registration
     pact approvals            list payments waiting for your approval
     pact approve [ID] [--yes] approve exactly what is shown (the only pending one if ID is omitted)
     pact deny ID [REASON]     deny a pending payment
@@ -109,7 +110,7 @@ def _demo(args) -> int:
 
     settings = _settings()
     print("PACT demo setup")
-    problems = [c for c in ops.run_doctor(settings, check_mcp=False) if c.name in
+    problems = [c for c in ops.run_doctor(settings, check_mcp=False, check_order=False) if c.name in
                 (".env file", "Admin token", "PayPal Sandbox credentials") and not c.ok]
     if problems:
         print(ops.format_checks(problems)[0])
@@ -227,7 +228,7 @@ def _cancel(args) -> int:
         print("\nCancel with:  pact cancel <request_id>")
         return 0
     try:
-        result = client.cancel(args.request_id)
+        result = client.cancel(args.request_id, force=args.force)
     except RuntimeError as exc:
         print(f"✗ {exc}")
         return 1
@@ -279,6 +280,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("cancel", help="cancel a payment stuck in checkout")
     p.add_argument("request_id", nargs="?")
+    p.add_argument("--force", action="store_true",
+                   help="close a payment PACT cannot verify, WITHOUT asking the provider: check the PayPal "
+                        "account by hand first; this releases the budget even if money was captured")
     p.set_defaults(func=_cancel)
 
     p = sub.add_parser("init", help="create tables and seed demo data")

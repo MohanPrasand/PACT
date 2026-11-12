@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from adapters.simulation.adapter import SimulationAdapter
 from merchant_lab.seed import seed_catalogue
 from pact_core.config import Settings
+from pact_core.errors import NotFound
 from pact_core.seed import seed_agents, seed_policies
 from pact_server.app import create_app
 
@@ -132,7 +133,8 @@ def test_full_purchase_over_http_then_replay_rejected(api):
     assert api.get("/admin/audit/verify", headers=ADMIN_H).json()["valid"] is True
 
 
-def test_cancel_redirect(api):
+def executing_payment(api):
+    """Drive a purchase to EXECUTING (checkout open at the provider). Returns (order, view)."""
     order = keyboard_order(api)
     req = api.post("/v1/authorizations", headers=agent_h(api), json=auth_body(order)).json()
     api.post(f"/admin/authorizations/{req['request_id']}/approve", headers=ADMIN_H, json={"request_hash": req["request_hash"]})
@@ -140,9 +142,224 @@ def test_cancel_redirect(api):
     e = api.post(f"/v1/authorizations/{req['request_id']}/execute", headers=agent_h(api), json={
         "grant_token": token, "merchant_id": order["merchant_id"], "order_id": order["order_id"],
         "amount_minor": order["total_minor"], "currency": "USD"}).json()
-    page = api.post(e["execution"]["approval_url"].replace(PUBLIC, "") + "/cancel", follow_redirects=True)
-    assert "Payment not completed" in page.text and "BUYER_CANCELLED" in page.text
+    assert e["state"] == "EXECUTING"
+    return order, e
+
+
+def contract_view(view, state="EXECUTING", **execution):
+    """A real view reshaped to the frozen checkout contract (docs/plans/paypal-gateway-fixes.md)."""
+    return {**view, "state": state, "execution": {**view["execution"], **execution}}
+
+
+class FakeCore:
+    """Replaces the two PactCore methods whose behaviour is changing, recording every call."""
+
+    def __init__(self, api, monkeypatch, *, cancel=None, abandon=None):
+        self.calls: list[tuple[str, str]] = []
+        core = api.app.state.core
+        monkeypatch.setattr(core, "handle_provider_cancel", self._method("handle_provider_cancel", cancel), raising=False)
+        monkeypatch.setattr(core, "buyer_abandon", self._method("buyer_abandon", abandon), raising=False)
+
+    def _method(self, name, result):
+        def call(provider_order_id):
+            self.calls.append((name, provider_order_id))
+            if isinstance(result, Exception):
+                raise result
+            assert result is not None, f"{name} must not be called"
+            return result
+        return call
+
+
+def test_cancel_redirect(api, monkeypatch):
+    """Simulated cancel -> /payments/cancel is non-terminal: the page offers "Try again" and an explicit cancel."""
+    _order, e = executing_payment(api)
+    oid, url = e["execution"]["provider_order_id"], e["execution"]["approval_url"]
+    fake = FakeCore(api, monkeypatch, cancel=contract_view(e, provider_status="BUYER_CANCELLED"))
+
+    page = api.post(url.replace(PUBLIC, "") + "/cancel", follow_redirects=True)
+    assert page.status_code == 200 and page.url.path == "/payments/cancel"
+    assert "Checkout cancelled" in page.text and "Nothing was charged" in page.text and "still open" in page.text
+    assert "Payment not completed" not in page.text
+    assert f'<a class=\'btn\' href="{url}">Try again</a>' in page.text
+    assert "action='/payments/abandon'" in page.text and "method='post'" in page.text
+    assert f"<input type='hidden' name='token' value=\"{oid}\">" in page.text
+    assert "Cancel this payment" in page.text
+    assert "Sandbox" not in page.text  # the PayPal login hint is for the PayPal provider only
+    assert fake.calls == [("handle_provider_cancel", oid)]  # a GET never abandons
+
+
+def test_sim_cancel_end_to_end_real_core(api):
+    """No fakes (#40): the cancel link leaves the payment open, and the same checkout can still be paid."""
+    order, e = executing_payment(api)
+    rid, checkout = e["request_id"], e["execution"]["approval_url"].replace(PUBLIC, "")
+    page = api.post(checkout + "/cancel", follow_redirects=True)
+    assert page.status_code == 200 and page.url.path == "/payments/cancel"
+    assert "Checkout cancelled" in page.text and "Nothing was charged" in page.text
+    assert "Try again" in page.text and "/payments/abandon" in page.text
+
+    st = api.get(f"/v1/authorizations/{rid}", headers=agent_h(api)).json()
+    assert st["state"] == "EXECUTING" and st["execution"]["provider_status"] == "BUYER_CANCELLED"
+
+    done = api.post(checkout + "/approve", follow_redirects=True)  # "Try again", then pay
+    assert "Payment complete" in done.text
+    assert api.get(f"/v1/authorizations/{rid}", headers=agent_h(api)).json()["state"] == "EXECUTED"
+    assert api.get(f"/merchant/orders/{order['order_id']}").json()["payment_status"] == "CAPTURED"
+
+
+def test_explicit_buyer_cancel_end_to_end_real_core(api):
+    """No fakes (#40): only the explicit POST ends the payment and releases the reservation."""
+    order, e = executing_payment(api)
+    rid, poid = e["request_id"], e["execution"]["provider_order_id"]
+    api.post(e["execution"]["approval_url"].replace(PUBLIC, "") + "/cancel", follow_redirects=True)
+    page = api.post("/payments/abandon", data={"token": poid})
+    assert page.status_code == 200 and "Payment not completed" in page.text and "BUYER_CANCELLED" in page.text
+    st = api.get(f"/v1/authorizations/{rid}", headers=agent_h(api)).json()
+    assert st["state"] == "FAILED" and st["execution"]["failure_reason"] == "BUYER_CANCELLED"
     assert api.get(f"/merchant/orders/{order['order_id']}").json()["payment_status"] == "CANCELLED"
+    again = api.post("/payments/abandon", data={"token": poid})  # double submit is harmless
+    assert again.status_code == 200 and "BUYER_CANCELLED" in again.text
+
+
+def test_cancel_page_escapes_approval_url_and_shows_paypal_hint(api, monkeypatch):
+    _order, e = executing_payment(api)
+    url = "https://www.sandbox.paypal.com/checkoutnow?token=5O1&x=\"><script>alert(1)</script>"
+    FakeCore(api, monkeypatch, cancel=contract_view(
+        e, provider_status="BUYER_CANCELLED", approval_url=url, provider="paypal",
+        provider_label="PayPal <Sandbox>", provider_order_id="5O1\"'><b>"))
+    page = api.get("/payments/cancel", params={"token": "5O1"})
+    assert page.status_code == 200 and "Checkout cancelled" in page.text
+    assert ('href="https://www.sandbox.paypal.com/checkoutnow?token=5O1&amp;x=&quot;&gt;&lt;script&gt;'
+            'alert(1)&lt;/script&gt;">Try again</a>') in page.text
+    assert "<script>" not in page.text and "<b>" not in page.text
+    assert "value=\"5O1&quot;&#x27;&gt;&lt;b&gt;\"" in page.text
+    assert "PayPal &lt;Sandbox&gt;" in page.text
+    assert "personal" in page.text and "docs/paypal-sandbox-setup.md" in page.text
+    assert "start a new purchase" not in page.text  # the payment is still open: retry in place
+
+
+@pytest.mark.parametrize("hostile", ["javascript:alert(1)", "data:text/html,<script>alert(1)</script>",
+                                     "//evil.example/x", " https://evil.example", "", None])
+@pytest.mark.parametrize("status", ["BUYER_CANCELLED", "INSTRUMENT_DECLINED"])
+def test_hostile_approval_url_is_not_linked(api, monkeypatch, status, hostile):
+    _order, e = executing_payment(api)
+    FakeCore(api, monkeypatch, cancel=contract_view(e, provider_status=status, approval_url=hostile))
+    page = api.get("/payments/cancel", params={"token": e["execution"]["provider_order_id"]})
+    assert page.status_code == 200
+    assert "<a " not in page.text and "href" not in page.text
+    assert "javascript:" not in page.text and "evil.example" not in page.text and "<script>" not in page.text
+    if status == "BUYER_CANCELLED":
+        assert "Cancel this payment" in page.text  # the explicit cancel stays available
+
+
+def test_cancel_query_token_is_never_reflected(api, monkeypatch):
+    _order, e = executing_payment(api)
+    FakeCore(api, monkeypatch, cancel=contract_view(e, provider_status="BUYER_CANCELLED"))
+    page = api.get("/payments/cancel", params={"token": "<script>zzq</script>"})
+    assert page.status_code == 200 and "zzq" not in page.text
+
+
+def test_cancel_after_capture_falls_through_to_result_page(api, monkeypatch):
+    _order, e = executing_payment(api)
+    fake = FakeCore(api, monkeypatch, cancel=contract_view(e, state="EXECUTED", provider_status="COMPLETED",
+                                                           capture_id="CAP-1"))
+    page = api.get("/payments/cancel", params={"token": e["execution"]["provider_order_id"]})
+    assert "Payment complete" in page.text and "CAP-1" in page.text
+    assert "Cancel this payment" not in page.text and "Try again" not in page.text
+    assert [c[0] for c in fake.calls] == ["handle_provider_cancel"]
+
+
+def test_abandon_calls_buyer_abandon_and_renders_failed_page(api, monkeypatch):
+    _order, e = executing_payment(api)
+    oid = e["execution"]["provider_order_id"]
+    fake = FakeCore(api, monkeypatch, abandon=contract_view(
+        e, state="FAILED", provider_status="BUYER_CANCELLED", failure_reason="BUYER_CANCELLED", provider="paypal"))
+    page = api.post("/payments/abandon", data={"token": oid})
+    assert page.status_code == 200 and "text/html" in page.headers["content-type"]
+    assert "Payment not completed" in page.text and "BUYER_CANCELLED" in page.text
+    assert "Nothing was charged" in page.text
+    assert "Try again" not in page.text and "Cancel this payment" not in page.text and "<a " not in page.text
+    assert "docs/paypal-sandbox-setup.md" in page.text and "start a new purchase" in page.text
+    assert fake.calls == [("buyer_abandon", oid)]
+
+
+def test_abandon_already_captured_renders_complete(api, monkeypatch):
+    _order, e = executing_payment(api)
+    FakeCore(api, monkeypatch, abandon=contract_view(e, state="EXECUTED", provider_status="COMPLETED",
+                                                     capture_id="CAP-9"))
+    page = api.post("/payments/abandon", data={"token": e["execution"]["provider_order_id"]})
+    assert page.status_code == 200 and "Payment complete" in page.text and "CAP-9" in page.text
+
+
+def test_abandon_unknown_token_is_404_page(api, monkeypatch):
+    fake = FakeCore(api, monkeypatch, abandon=NotFound("REQUEST_NOT_FOUND", "No payment for <order>"))
+    page = api.post("/payments/abandon", data={"token": "SIM-NOPE"})
+    assert page.status_code == 404 and "Payment not found" in page.text
+    assert "No payment for &lt;order&gt;" in page.text and "<order>" not in page.text
+    assert fake.calls == [("buyer_abandon", "SIM-NOPE")]
+
+
+_FORM = {"content-type": "application/x-www-form-urlencoded"}
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"data": {"token": "x" * 65}}, {"data": {}}, {"data": {"token": ""}}, {"data": {"other": "SIM-1"}},
+    {"content": b"token=a&token=b", "headers": _FORM},
+    {"content": b"token=\xff\xfe", "headers": _FORM},
+    {"content": b"token=a&pad=" + b"x" * 2000, "headers": _FORM},
+    {"json": {"token": "SIM-1"}},
+], ids=["too-long", "empty-body", "blank", "missing", "duplicate", "not-utf8", "oversized-body", "json"])
+def test_abandon_invalid_token_is_rejected_without_core_call(api, monkeypatch, kwargs):
+    fake = FakeCore(api, monkeypatch)
+    r = api.post("/payments/abandon", **kwargs)
+    assert r.status_code == 422 and r.json()["error"]["code"] == "INVALID_REQUEST"
+    assert fake.calls == []
+
+
+def test_abandon_accepts_64_char_token_and_get_is_not_allowed(api, monkeypatch):
+    _order, e = executing_payment(api)
+    fake = FakeCore(api, monkeypatch, abandon=contract_view(e, state="FAILED", failure_reason="BUYER_CANCELLED"))
+    assert api.post("/payments/abandon", data={"token": "x" * 64}).status_code == 200
+    assert fake.calls == [("buyer_abandon", "x" * 64)]
+    assert api.get("/payments/abandon", params={"token": "x"}).status_code in (404, 405)
+    assert len(fake.calls) == 1
+
+
+def test_cancel_query_token_validation(api, monkeypatch):
+    fake = FakeCore(api, monkeypatch)
+    assert api.get("/payments/cancel", params={"token": "x" * 65}).status_code == 422
+    assert api.get("/payments/cancel").status_code == 422
+    assert fake.calls == []
+
+
+def test_declined_page_links_back_to_checkout(api, monkeypatch):
+    _order, e = executing_payment(api)
+    url = e["execution"]["approval_url"]
+    monkeypatch.setattr(api.app.state.core, "handle_provider_return",
+                        lambda _t: contract_view(e, provider_status="INSTRUMENT_DECLINED"))
+    page = api.get("/payments/return", params={"token": e["execution"]["provider_order_id"]})
+    assert page.status_code == 200 and "Payment method declined" in page.text
+    assert "PayPal declined the payment method" in page.text and "Nothing was charged" in page.text
+    assert f'href="{url}">Choose another payment method</a>' in page.text
+    assert "Cancel this payment" not in page.text and "Payment not completed" not in page.text
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("CAPTURE_REJECTED:COMPLIANCE_VIOLATION", ["PayPal refused the payment and no money moved",
+                                               "<code>COMPLIANCE_VIOLATION</code>"]),
+    ("CAPTURE_REJECTED:<img src=x>", ["PayPal refused the payment", "<code>&lt;img src=x&gt;</code>"]),
+    ("CHECKOUT_TIMEOUT", ["not completed in time", "Nothing was charged"]),
+    ("PROVIDER_ORDER_NOT_FOUND", ["PayPal order expired", "Nothing was charged"]),
+])
+def test_failure_reason_pages(api, monkeypatch, reason, expected):
+    _order, e = executing_payment(api)
+    view = contract_view(e, state="FAILED", failure_reason=reason, provider="paypal", provider_label="PayPal Sandbox")
+    monkeypatch.setattr(api.app.state.core, "handle_provider_return", lambda _t: view)
+    page = api.get("/payments/return", params={"token": "5O1"})
+    assert page.status_code == 200 and "Payment not completed" in page.text
+    for text in expected:
+        assert text in page.text
+    assert "<img" not in page.text and "<a " not in page.text
+    assert "docs/paypal-sandbox-setup.md" not in page.text  # the login hint is for cancelled checkouts only
 
 
 def test_unknown_return_token_page(api):

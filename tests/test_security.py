@@ -536,15 +536,25 @@ def _live_web_payment(api):
     return order, r
 
 
-@pytest.mark.xfail(strict=True, reason="SEC-1: GET /payments/cancel is unauthenticated and trusts the bare provider "
-                                       "order id (leaked by the public order-status route), so anyone can fail a "
-                                       "live payment and release its budget")
 def test_anonymous_party_cannot_cancel_someone_elses_live_payment(api):
+    """SEC-1, GET half: fixed by #40. The cancel link only records that the buyer left; it ends nothing."""
     order, r = _live_web_payment(api)
     provider_order_id = api.get(f"/merchant/orders/{order['order_id']}/status").json()["authorization"]["provider_order_id"]
     assert provider_order_id
     attacker = TestClient(api.app)  # no cookies, no credentials, never saw the buyer's session
     attacker.get("/payments/cancel", params={"token": provider_order_id})
+    state = api.get(f"/admin/authorizations/{r['request_id']}", headers=ADMIN_H).json()["state"]
+    assert state == "EXECUTING", "a third party aborted a payment it does not own"
+
+
+@pytest.mark.xfail(strict=True, reason="SEC-1 (remaining): POST /payments/abandon is unauthenticated and trusts the bare "
+                                       "provider order id (leaked by the public order-status route), so anyone can "
+                                       "still end a live, uncaptured payment and release its budget")
+def test_anonymous_party_cannot_abandon_someone_elses_live_payment(api):
+    order, r = _live_web_payment(api)
+    provider_order_id = api.get(f"/merchant/orders/{order['order_id']}/status").json()["authorization"]["provider_order_id"]
+    attacker = TestClient(api.app)
+    attacker.post("/payments/abandon", data={"token": provider_order_id})
     state = api.get(f"/admin/authorizations/{r['request_id']}", headers=ADMIN_H).json()["state"]
     assert state == "EXECUTING", "a third party aborted a payment it does not own"
 
