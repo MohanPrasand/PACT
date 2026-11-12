@@ -255,6 +255,15 @@ class ApprovalClient:
         return self._json(self.http.post(f"/admin/authorizations/{request_id}/approve",
                                          json={"request_hash": request_hash, "note": note}))
 
+    def cancel(self, request_id: str) -> dict:
+        return self._json(self.http.post(f"/admin/authorizations/{request_id}/cancel"))
+
+    def stuck(self) -> list[dict]:
+        out = []
+        for state in ("EXECUTING", "UNKNOWN"):
+            out += self._json(self.http.get("/admin/authorizations", params={"state": state}))["authorizations"]
+        return out
+
     def deny(self, request_id: str, reason: str) -> dict:
         return self._json(self.http.post(f"/admin/authorizations/{request_id}/deny", json={"reason": reason}))
 

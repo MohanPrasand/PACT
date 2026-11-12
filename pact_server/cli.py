@@ -5,6 +5,7 @@
     pact approvals            list payments waiting for your approval
     pact approve [ID] [--yes] approve exactly what is shown (the only pending one if ID is omitted)
     pact deny ID [REASON]     deny a pending payment
+    pact cancel [ID]          cancel a payment stuck in checkout (checks the provider first; lists them if no ID)
     pact init [--reset]       create tables and seed catalogue, policies and demo agents
     pact serve [--port N]     run the API (+ dashboard if built); refuses to start a second server
     pact stop                 stop the running server
@@ -211,6 +212,31 @@ def _deny(args) -> int:
     return 0
 
 
+def _cancel(args) -> int:
+    client = ops.ApprovalClient.from_settings(_settings())
+    if not args.request_id:
+        stuck = client.stuck()
+        if not stuck:
+            print("No payments are in progress.")
+            return 0
+        for p in stuck:
+            print(f"{p['request_id']}  {p['amount']} {p['currency']}  {p['state']}  provider={p['execution']['provider']} "
+                  f"status={p['execution']['provider_status']}")
+        print("\nCancel with:  pact cancel <request_id>")
+        return 0
+    try:
+        result = client.cancel(args.request_id)
+    except RuntimeError as exc:
+        print(f"✗ {exc}")
+        return 1
+    ex = result["execution"]
+    if result["state"] == "EXECUTED":
+        print(f"! {args.request_id} had already been paid at the provider; it was completed instead (capture {ex['capture_id']}).")
+    else:
+        print(f"✓ {args.request_id} -> {result['state']} ({ex['failure_reason']}); its budget reservation was released.")
+    return 0
+
+
 def _verify(_args) -> int:
     from pact_core import audit
     from pact_core.db import Database
@@ -248,6 +274,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("request_id")
     p.add_argument("reason", nargs="*")
     p.set_defaults(func=_deny)
+
+    p = sub.add_parser("cancel", help="cancel a payment stuck in checkout")
+    p.add_argument("request_id", nargs="?")
+    p.set_defaults(func=_cancel)
 
     p = sub.add_parser("init", help="create tables and seed demo data")
     p.add_argument("--reset", action="store_true", help="drop all tables first (destroys data)")

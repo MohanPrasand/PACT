@@ -293,6 +293,10 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
     def admin_revoke(request_id: str, admin: str = Depends(admin_auth)):
         return core.admin_revoke(admin, request_id)
 
+    @app.post("/admin/authorizations/{request_id}/cancel", tags=["admin"])
+    def cancel_payment(request_id: str, admin: str = Depends(admin_auth)):
+        return core.cancel_payment(admin, request_id)
+
     @app.post("/admin/authorizations/{request_id}/reconcile", tags=["admin"])
     def reconcile(request_id: str, _admin: str = Depends(admin_auth)):
         return core.reconcile(request_id)
