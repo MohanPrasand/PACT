@@ -1,4 +1,4 @@
-"""Shared fixtures. Frozen after Wave 0 of Phase 1 — add per-module fixtures in your own test file."""
+"""Shared fixtures. Frozen during parallel waves — add per-module fixtures in your own test file."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+import merchant_lab.models  # noqa: F401  (register Merchant Lab tables for create_all)
 from pact_core.db import Database
 
 

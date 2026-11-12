@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "pact": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/PACT", "pact-mcp"],
+      "env": {
+        "PACT_API_URL": "http://localhost:8000",
+        "PACT_AGENT_KEY": "pact_ak_... (ag_shopping key from .pact/agent_keys.json)"
+      }
+    }
+  }
+}
