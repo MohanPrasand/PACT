@@ -227,6 +227,35 @@ class ExecutionGateway:
             return self._finalize(rid, po)
         return self._fail(rid, "BUYER_CANCELLED", merchant_status="CANCELLED")
 
+    def abandon(self, request_id: str, actor: str) -> dict[str, Any]:
+        """Operator cancels a payment stuck in checkout (e.g. the buyer gave up). The provider is asked first:
+        a captured payment is finalized, never cancelled; otherwise the request fails and funds are released."""
+        ctx = self.ctx
+        with ctx.db.transaction() as s:
+            req = ctx.load_request(s, request_id)
+            if req.state not in LIVE:
+                raise Conflict("NOT_EXECUTING", f"Request is {req.state}; only EXECUTING/UNKNOWN payments can be cancelled")
+            poid = req.provider_order_id
+        if poid is None:
+            view = self.reconcile(request_id)  # resolve an unknown create first (idempotent)
+            poid = view["execution"]["provider_order_id"]
+            if view["state"] not in LIVE:
+                return view
+        with ctx.db.transaction() as s:
+            req = ctx.load_request(s, request_id)
+            adapter = ctx.adapters[req.provider]
+        if poid is not None:
+            try:
+                po = adapter.get_order(poid)
+            except (ProviderTimeout, ProviderError) as exc:
+                raise Conflict("CANNOT_VERIFY_PROVIDER",
+                               f"Could not confirm the provider state ({type(exc).__name__}); try again later") from None
+            if po.status == "COMPLETED":
+                return self._finalize(request_id, po)
+        with ctx.db.transaction() as s:
+            ctx.audit(s, "CANCEL_REQUESTED", actor, request_id, provider_order_id=poid)
+        return self._fail(request_id, "ABANDONED_CHECKOUT", merchant_status="CANCELLED")
+
     # ------------------------------------------------------------------ reconciliation
     def reconcile(self, request_id: str) -> dict[str, Any]:
         ctx = self.ctx

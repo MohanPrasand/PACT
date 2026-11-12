@@ -239,3 +239,44 @@ def test_shopper_workspace(tmp_path):
     ops.prepare_shopper_dir(tmp_path / "shop")
     md = (tmp_path / "shop" / "CLAUDE.md").read_text()
     assert "pact_wait_for_status" in md and "cannot approve" in md
+
+
+# ---------------------------------------------------------------- cancel stuck payments
+
+def _executing(stack):
+    mcp, approvals = stack["mcp"], stack["approvals"]
+    order, req = keyboard_request(mcp)
+    approvals.approve(req["request_id"], req["request_hash"])
+    granted = call(mcp, "pact_get_authorization_status", request_id=req["request_id"])
+    ex = call(mcp, "pact_execute_action", request_id=req["request_id"], grant_token=granted["grant_token"],
+              order_id=order["order_id"], merchant_id=order["merchant_id"], amount=order["total"])
+    return order, req, ex
+
+
+def test_cancel_abandoned_checkout_releases(stack, monkeypatch, capsys):
+    from pact_server import cli
+
+    order, req, ex = _executing(stack)
+    monkeypatch.setattr(cli, "_settings", lambda: None)
+    monkeypatch.setattr(ops.ApprovalClient, "from_settings", classmethod(lambda cls, s: stack["approvals"]))
+    assert cli.main(["cancel"]) == 0 and req["request_id"] in capsys.readouterr().out
+    assert cli.main(["cancel", req["request_id"]]) == 0
+    assert "ABANDONED_CHECKOUT" in capsys.readouterr().out
+    budget = {s["scope"]: s for s in call(stack["mcp"], "pact_get_budget")["scopes"]}
+    assert budget["org:global"]["reserved_minor"] == 0
+    assert stack["admin"].get(f"/merchant/orders/{order['order_id']}").json()["payment_status"] == "CANCELLED"
+
+
+def test_cancel_after_provider_capture_completes_instead(stack):
+    order, req, ex = _executing(stack)
+    poid = ex["execution"]["provider_order_id"]
+    stack["sim"].buyer_approve(poid)
+    stack["sim"].capture_order(poid, f"pact-{req['request_id']}-capture")  # paid at provider, PACT not told
+    result = stack["approvals"].cancel(req["request_id"])
+    assert result["state"] == "EXECUTED"  # never cancel money that moved
+
+
+def test_cancel_requires_admin_and_live_state(stack):
+    order, req = keyboard_request(stack["mcp"])
+    with pytest.raises(RuntimeError, match="NOT_EXECUTING"):
+        stack["approvals"].cancel(req["request_id"])
