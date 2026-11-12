@@ -14,6 +14,8 @@
 > - Demo currency defaults to **USD** (`PACT_CURRENCY`). PayPal supports INR only for in-country India accounts (§9.2 asks to verify this).
 > - MCP tool names use `_` instead of `.` (e.g. `pact_request_authorization`) because Claude tool names must match `^[a-zA-Z0-9_-]{1,64}$`.
 > - The MCP server uses `MCPServer` from the official `mcp` SDK 2.x (the successor of FastMCP) and is a thin HTTP client over the PACT REST API using an agent key.
+> - Malformed policy documents fail closed with `<SCOPE>_POLICY_INVALID`; the merchant policy document is optional (no merchant restrictions when absent).
+> - A Merchant Lab storefront UI (catalogue, live cart, order-status timeline) was added for demo visibility: issues #22–#25. It never initiates payments, and it adds three MCP cart tools (`merchant_add_to_cart`, `merchant_view_cart`, `merchant_checkout_cart`).
 
 ---
 
