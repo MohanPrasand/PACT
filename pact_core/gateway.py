@@ -180,6 +180,8 @@ class ExecutionGateway:
             req.provider_order_id = po.provider_order_id
             req.provider_status = po.status
             req.approval_url = po.approval_url
+            if req.failure_reason == "PROVIDER_TIMEOUT_ON_CREATE":
+                req.failure_reason = None  # the create is answered; do not show a stale reason on an open checkout
             ctx.audit(s, "PROVIDER_ORDER_CREATED", "gateway", req.id, provider=req.provider,
                       provider_order_id=po.provider_order_id, status=po.status)
             order_id = req.order_id

@@ -272,3 +272,16 @@ def test_amount_mismatch_is_audited_once(env, monkeypatch):
     assert events(env, rid).count("CAPTURE_MISMATCH") == 1
     assert state_of(env, rid) == ("UNKNOWN", "CAPTURE_AMOUNT_MISMATCH") and org(env)["reserved_minor"] == 7900
     consistent(env)
+
+
+def test_recovered_create_timeout_leaves_no_stale_reason(env):
+    order, view, token = env.granted("Atlas")
+    env.sim.inject("create", "timeout", after_side_effect=True)
+    v = env.core.execute(env.agent(), env.exec_input(view, order, token))
+    rid = view["request_id"]
+    assert v["state"] == "UNKNOWN" and v["execution"]["failure_reason"] == "PROVIDER_TIMEOUT_ON_CREATE"
+    r = env.core.reconcile(rid)  # the create is repeated with the same key and answers
+    assert r["state"] == "EXECUTING" and r["execution"]["failure_reason"] is None
+    env.clock.advance(seconds=7200)
+    assert env.core.expire_stale() == [rid] and state_of(env, rid) == ("FAILED", "CHECKOUT_TIMEOUT")
+    consistent(env)

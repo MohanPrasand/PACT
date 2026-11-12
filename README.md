@@ -195,18 +195,19 @@ Tests never read `.env` and need no PayPal credentials. CI (`.github/workflows/c
 | Area | Tests |
 |---|---:|
 | State machine | 317 |
-| Policy engine | 218 |
+| Policy engine | 219 |
 | PayPal + simulation adapters | 212 |
 | Merchant Lab | 140 |
 | Grant manager | 75 |
 | Budget engine | 57 |
 | Configuration | 69 |
-| Authorization service + execution gateway (incl. capture money-safety regressions) | 110 |
+| Authorization service + execution gateway (incl. capture money-safety regressions) | 111 |
 | REST API + MCP server | 59 |
 | Demo convenience (wait tool, CLI, doctor, lock) | 24 |
 | Audit log | 43 |
 | Persistence and concurrency | 6 |
-| **Total** | **1330** |
+| Storefront + agent keys file | 11 |
+| **Total** | **1343** |
 
 Counts are per test file, measured on the `fix/paypal-gateway` branch with all of #38–#43 merged.
 
