@@ -192,6 +192,137 @@ def test_doctor_reports_stopped_server(tmp_path, monkeypatch):
     assert not checks["PACT server"].ok and "pact serve" in checks["PACT server"].fix
 
 
+# ---------------------------------------------------------------- doctor: PayPal order check (mock transport, no network)
+
+PAYEE = {"email_address": "sb-merchant@business.example.com", "merchant_id": "MERCHANT123"}
+
+
+def _paypal_settings(tmp_path, **extra):
+    return Settings(_env_file=None, PACT_ADMIN_TOKEN=ADMIN, PACT_PAYMENT_PROVIDER="paypal",
+                    PAYPAL_CLIENT_ID="doctor-client-id", PAYPAL_CLIENT_SECRET="doctor-client-secret",
+                    PACT_DATABASE_URL=f"sqlite:///{tmp_path / 'doc.db'}", **extra)
+
+
+def _paypal_transport(order_response, seen=None):
+    """A fake PayPal: OAuth always succeeds; ``order_response`` answers POST /v2/checkout/orders."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/oauth2/token":
+            return httpx.Response(200, json={"access_token": "doctor-access-token", "expires_in": 3600})
+        assert request.method == "POST" and request.url.path == "/v2/checkout/orders"
+        if seen is not None:
+            seen.append(request)
+        return order_response(request)
+    return httpx.MockTransport(handler)
+
+
+def _order_created(payee=None):
+    def respond(request):
+        sent = json.loads(request.content)["purchase_units"][0]
+        unit = {"reference_id": sent["reference_id"], "amount": sent["amount"]}
+        if payee is not None:
+            unit["payee"] = payee
+        return httpx.Response(201, json={
+            "id": "5O190127TN364715T", "status": "PAYER_ACTION_REQUIRED", "purchase_units": [unit],
+            "links": [{"rel": "payer-action", "href": "https://www.sandbox.paypal.com/checkoutnow?token=5O190127TN364715T"}]})
+    return respond
+
+
+def _doctor(settings, transport, **kwargs):
+    dead = httpx.Client(transport=httpx.MockTransport(lambda r: (_ for _ in ()).throw(httpx.ConnectError("down"))),
+                        base_url="http://localhost:9")
+    checks = ops.run_doctor(settings, check_mcp=False, http=dead, paypal_transport=transport, **kwargs)
+    return {c.name: c for c in checks}, ops.format_checks(checks)[0]
+
+
+def test_doctor_paypal_order_check_passes(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    seen = []
+    settings = _paypal_settings(tmp_path)
+    checks, report = _doctor(settings, _paypal_transport(_order_created(), seen))
+    assert checks["PayPal Sandbox credentials"].ok
+    order = checks[ops.PAYPAL_ORDER_CHECK]
+    assert order.ok and "PAYER_ACTION_REQUIRED" in order.detail and settings.currency in order.detail
+    [request] = seen
+    body = json.loads(request.content)
+    assert body["purchase_units"][0]["amount"] == {"currency_code": settings.currency, "value": "1.00"}
+    assert request.headers["PayPal-Request-Id"] == f"pact-{body['purchase_units'][0]['reference_id']}-create"
+    for secret in ("doctor-client-secret", "doctor-access-token"):
+        assert secret not in report
+
+    # A second run uses a fresh reference and idempotency key, so it is a new order, not a replay.
+    _doctor(settings, _paypal_transport(_order_created(), seen))
+    assert seen[0].headers["PayPal-Request-Id"] != seen[1].headers["PayPal-Request-Id"]
+
+
+def test_doctor_paypal_order_check_reports_provider_code_with_hint(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    rejected = lambda request: httpx.Response(422, json={  # noqa: E731
+        "name": "UNPROCESSABLE_ENTITY", "debug_id": "abc123",
+        "details": [{"issue": "CURRENCY_NOT_SUPPORTED", "description": "Currency code is not currently supported."}]})
+    checks, report = _doctor(_paypal_settings(tmp_path, PACT_CURRENCY="INR"), _paypal_transport(rejected))
+    assert checks["PayPal Sandbox credentials"].ok
+    order = checks[ops.PAYPAL_ORDER_CHECK]
+    assert not order.ok and not order.warn_only and order.detail == "CURRENCY_NOT_SUPPORTED"
+    assert "PACT_CURRENCY=USD" in order.fix
+    assert "CURRENCY_NOT_SUPPORTED" in report and "→ set PACT_CURRENCY=USD" in report
+    assert not ops.format_checks(list(checks.values()))[1]
+
+    # A code without a specific hint still names the code and points at the setup guide.
+    unknown = lambda request: httpx.Response(422, json={"details": [{"issue": "SOMETHING_NEW"}]})  # noqa: E731
+    checks, _ = _doctor(_paypal_settings(tmp_path), _paypal_transport(unknown))
+    assert checks[ops.PAYPAL_ORDER_CHECK].detail == "SOMETHING_NEW"
+    assert ops.SANDBOX_GUIDE in checks[ops.PAYPAL_ORDER_CHECK].fix
+
+
+def test_doctor_paypal_order_check_handles_timeout(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    def timeout(request):
+        raise httpx.ReadTimeout("slow", request=request)
+
+    for response in (timeout, lambda request: httpx.Response(503)):
+        checks, report = _doctor(_paypal_settings(tmp_path), _paypal_transport(response))
+        assert checks["PayPal Sandbox credentials"].ok  # the credentials are fine; only the order is unknown
+        order = checks[ops.PAYPAL_ORDER_CHECK]
+        assert not order.ok and "timeout" in order.detail and "pact doctor" in order.fix
+        assert "Database seeded" in checks  # the doctor carried on with the remaining checks
+
+
+def test_doctor_paypal_order_check_payee_present_or_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    checks, report = _doctor(_paypal_settings(tmp_path), _paypal_transport(_order_created()))
+    order = checks[ops.PAYPAL_ORDER_CHECK]
+    assert order.ok and "personal Sandbox account" in order.note and "received by" not in order.note
+    assert "personal Sandbox account" in report  # the hint is shown even though the check passed
+
+    # Formatting is independent of whether the adapter already parses the payee (A2 adds it to raw).
+    assert ops.describe_payee({"payee": PAYEE}) == "sb-merchant@business.example.com, merchant id MERCHANT123"
+    assert ops.describe_payee({"payee": {"merchant_id": "MERCHANT123"}}) == "merchant id MERCHANT123"
+    for raw in (None, {}, {"payee": None}, {"payee": "x"}, {"payee": {}}, {"payee": {"email_address": 5}}):
+        assert ops.describe_payee(raw) is None
+
+    class WithPayee:
+        def create_order(self, req):
+            from pact_core.ports import ProviderOrder
+            return ProviderOrder("ORDER1", "PAYER_ACTION_REQUIRED", raw={"payee": PAYEE})
+
+    check = ops.paypal_order_check(WithPayee(), _paypal_settings(tmp_path))
+    assert check.ok and "sb-merchant@business.example.com" in check.note and "MERCHANT123" in check.note
+    assert "personal Sandbox account" in check.note
+    assert "sb-merchant@business.example.com" in ops.format_checks([check])[0]
+
+
+def test_doctor_skips_order_check_when_oauth_fails_or_disabled(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    denied = httpx.MockTransport(lambda r: httpx.Response(401, json={"error": "invalid_client"}))
+    checks, _ = _doctor(_paypal_settings(tmp_path), denied)
+    assert not checks["PayPal Sandbox credentials"].ok and ops.PAYPAL_ORDER_CHECK not in checks
+
+    seen = []
+    checks, _ = _doctor(_paypal_settings(tmp_path), _paypal_transport(_order_created(), seen), check_order=False)
+    assert checks["PayPal Sandbox credentials"].ok and ops.PAYPAL_ORDER_CHECK not in checks and not seen
+
+
 def test_rotate_agent_key(stack):
     from pact_core.core import PactCore  # noqa: F401  (import check)
 
