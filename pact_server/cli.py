@@ -41,14 +41,15 @@ def _seed(settings, reset: bool = False) -> dict:
     db = Database(settings.database_url)
     if reset:
         db.drop_all()
-        if ops.KEYS_FILE.exists():
-            ops.KEYS_FILE.unlink()
+        kf = ops.keys_file(settings.database_url)
+        if kf.exists():
+            kf.unlink()
     db.create_all()
     catalogue = seed_catalogue(db)
     policies = seed_policies(db)
     keys = seed_agents(db)
     if keys:
-        ops.save_keys(keys)
+        ops.save_keys(keys, ops.keys_file(settings.database_url))
     return {"db": db, "catalogue": catalogue, "policies": policies, "new_keys": keys}
 
 
@@ -62,10 +63,10 @@ def _init(args) -> int:
     print(f"Catalogue: {r['catalogue']['merchants_total']} merchants, {r['catalogue']['products_total']} products")
     print(f"Policies:  {len(r['policies'])} loaded" if r["policies"] else "Policies:  already present (kept)")
     if r["new_keys"]:
-        print(f"Agents:    {len(r['new_keys'])} created; API keys written to {ops.KEYS_FILE} (mode 600). "
+        print(f"Agents:    {len(r['new_keys'])} created; API keys written to {ops.keys_file(settings.database_url)} (mode 600). "
               "Only hashes are stored in the DB.")
     else:
-        print(f"Agents:    already present; keys are in {ops.KEYS_FILE}")
+        print(f"Agents:    already present; keys are in {ops.keys_file(settings.database_url)}")
     if not settings.admin_token:
         print("WARNING:   PACT_ADMIN_TOKEN is not set; approvals will be disabled.", file=sys.stderr)
     print(f"Provider:  {settings.payment_provider}  ·  currency {settings.currency}")
@@ -117,13 +118,14 @@ def _demo(args) -> int:
     r = _seed(settings)
     print(f" ✓ data          {r['catalogue']['products_total']} products, policies and demo agents ready")
 
-    keys = ops.load_keys()
+    kf = ops.keys_file(settings.database_url)
+    keys = ops.load_keys(kf)
     rotated = False
     if ops.SHOPPING_AGENT not in keys:
         keys[ops.SHOPPING_AGENT] = rotate_agent_key(r["db"], ops.SHOPPING_AGENT)
-        ops.save_keys({ops.SHOPPING_AGENT: keys[ops.SHOPPING_AGENT]})
+        ops.save_keys({ops.SHOPPING_AGENT: keys[ops.SHOPPING_AGENT]}, kf)
         rotated = True
-        print(f" ✓ agent key     issued a new key for {ops.SHOPPING_AGENT} ({ops.KEYS_FILE})")
+        print(f" ✓ agent key     issued a new key for {ops.SHOPPING_AGENT} ({kf})")
 
     shopper = Path(args.shopper_dir).expanduser()
     if not args.no_mcp:
