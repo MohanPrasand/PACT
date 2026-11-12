@@ -67,7 +67,14 @@ modified by this review.
   secret) into `return_url`/`cancel_url` and require it; do not treat the bare provider order id as proof. Make
   state changes POST, or make cancel only record intent and let reconciliation decide. Stop returning
   `provider_order_id` from the public status route.
-- Test: `test_anonymous_party_cannot_cancel_someone_elses_live_payment` (SEC-1).
+- Status (after #40, `fix/paypal-gateway`): **partly fixed.** `GET /payments/cancel` no longer ends a payment; it only
+  records `BUYER_CANCELLED` on a request that stays `EXECUTING`, so prefetchers, link scanners and `<img src>` are
+  harmless. Still open: `POST /payments/abandon` (the buyer's explicit cancel) is unauthenticated and accepts the same
+  leaked provider order id, so a deliberate attacker can still end a live, uncaptured payment. It cannot touch a
+  payment whose capture is in flight, in doubt or done. The nonce fix above is still needed, and the public status
+  route still returns `provider_order_id`.
+- Tests: `test_anonymous_party_cannot_cancel_someone_elses_live_payment` (GET, passes),
+  `test_anonymous_party_cannot_abandon_someone_elses_live_payment` (POST, expected failure until fixed).
 
 ### SEC-2 (Low/Medium) No framing or content-type protection
 - Where: `pact_server/app.py` (no middleware; every route incl. the StaticFiles mount at line 402, `_page()` at 420).
