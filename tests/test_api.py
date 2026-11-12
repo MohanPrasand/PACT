@@ -189,13 +189,35 @@ def test_cancel_redirect(api, monkeypatch):
 
 
 def test_sim_cancel_end_to_end_real_core(api):
-    """No fakes: the simulated cancel still lands on a rendered cancel page, under the old (terminal) core
-    and under the contract (non-terminal) core alike."""
-    _order, e = executing_payment(api)
-    page = api.post(e["execution"]["approval_url"].replace(PUBLIC, "") + "/cancel", follow_redirects=True)
+    """No fakes (#40): the cancel link leaves the payment open, and the same checkout can still be paid."""
+    order, e = executing_payment(api)
+    rid, checkout = e["request_id"], e["execution"]["approval_url"].replace(PUBLIC, "")
+    page = api.post(checkout + "/cancel", follow_redirects=True)
     assert page.status_code == 200 and page.url.path == "/payments/cancel"
-    assert "Nothing was charged" in page.text
-    assert "Checkout cancelled" in page.text or "Payment not completed" in page.text
+    assert "Checkout cancelled" in page.text and "Nothing was charged" in page.text
+    assert "Try again" in page.text and "/payments/abandon" in page.text
+
+    st = api.get(f"/v1/authorizations/{rid}", headers=agent_h(api)).json()
+    assert st["state"] == "EXECUTING" and st["execution"]["provider_status"] == "BUYER_CANCELLED"
+
+    done = api.post(checkout + "/approve", follow_redirects=True)  # "Try again", then pay
+    assert "Payment complete" in done.text
+    assert api.get(f"/v1/authorizations/{rid}", headers=agent_h(api)).json()["state"] == "EXECUTED"
+    assert api.get(f"/merchant/orders/{order['order_id']}").json()["payment_status"] == "CAPTURED"
+
+
+def test_explicit_buyer_cancel_end_to_end_real_core(api):
+    """No fakes (#40): only the explicit POST ends the payment and releases the reservation."""
+    order, e = executing_payment(api)
+    rid, poid = e["request_id"], e["execution"]["provider_order_id"]
+    api.post(e["execution"]["approval_url"].replace(PUBLIC, "") + "/cancel", follow_redirects=True)
+    page = api.post("/payments/abandon", data={"token": poid})
+    assert page.status_code == 200 and "Payment not completed" in page.text and "BUYER_CANCELLED" in page.text
+    st = api.get(f"/v1/authorizations/{rid}", headers=agent_h(api)).json()
+    assert st["state"] == "FAILED" and st["execution"]["failure_reason"] == "BUYER_CANCELLED"
+    assert api.get(f"/merchant/orders/{order['order_id']}").json()["payment_status"] == "CANCELLED"
+    again = api.post("/payments/abandon", data={"token": poid})  # double submit is harmless
+    assert again.status_code == 200 and "BUYER_CANCELLED" in again.text
 
 
 def test_cancel_page_escapes_approval_url_and_shows_paypal_hint(api, monkeypatch):

@@ -122,7 +122,8 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
     lab = MerchantLab(db)
     core = PactCore(db, MerchantLabOrderSource(lab), adapters, provider=provider, currency=settings.currency,
                     public_url=settings.public_url, grant_ttl_seconds=settings.grant_ttl_seconds,
-                    approval_ttl_seconds=settings.approval_ttl_seconds, clock=clock)
+                    approval_ttl_seconds=settings.approval_ttl_seconds,
+                    checkout_ttl_seconds=settings.checkout_ttl_seconds, clock=clock)
     admin_token = settings.admin_token.get_secret_value() if settings.admin_token else None
     sim = adapters.get("simulation")
 
@@ -391,10 +392,8 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
             o = sim.lookup(order_id)
             if o is None:
                 return _page("Unknown checkout", "<p>No such simulated order.</p>", status=404)
-            try:
-                sim.buyer_cancel(order_id)
-            except Exception as exc:
-                return _page("Cannot cancel", f"<p>{html.escape(str(exc))}</p>", status=409)
+            # Like PayPal's "cancel and return" link: the buyer just leaves. The order is not voided, so
+            # "Try again" on the cancel page still leads to a payable checkout.
             return RedirectResponse(f"{o.cancel_url}?token={order_id}", status_code=303)
 
     # ------------------------------------------------------------------ dashboard (built SPA) or index
