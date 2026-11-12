@@ -40,12 +40,12 @@ Wave B starts only after A1 is merged into the integration branch, because B1 ed
 ```
 dev
  └─ fix/paypal-gateway                    ← integration branch (this worktree)
-     ├─ fix/paypal-gateway/a1-correctness  ← agent A1
-     ├─ fix/paypal-gateway/a2-adapter      ← agent A2
-     ├─ fix/paypal-gateway/a3-doctor       ← agent A3
-     ├─ fix/paypal-gateway/b1-lifecycle    ← agent B1 (cut after A1 merges)
-     ├─ fix/paypal-gateway/b2-pages        ← agent B2 (cut after A1 merges)
-     └─ fix/paypal-gateway/b3-docs         ← agent B3
+     ├─ fix/paypal-gateway-a1-correctness  ← agent A1
+     ├─ fix/paypal-gateway-a2-adapter      ← agent A2
+     ├─ fix/paypal-gateway-a3-doctor       ← agent A3
+     ├─ fix/paypal-gateway-b1-lifecycle    ← agent B1 (cut after A1 merges)
+     ├─ fix/paypal-gateway-b2-pages        ← agent B2 (cut after A1 merges)
+     └─ fix/paypal-gateway-b3-docs         ← agent B3
 ```
 
 Each agent runs with `isolation: "worktree"`, commits to its own branch, and never pushes. The main session merges each branch into `fix/paypal-gateway` with `--no-ff` and runs the full suite after every merge.
