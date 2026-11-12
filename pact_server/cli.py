@@ -1,7 +1,8 @@
 """``pact`` command-line interface.
 
     pact demo                 one command: check config, seed, set up the shopper workspace + MCP, serve
-    pact doctor               diagnose configuration, PayPal credentials, server and MCP registration
+    pact doctor               diagnose configuration, PayPal credentials (creates one small unpaid Sandbox
+                              test order), server and MCP registration
     pact approvals            list payments waiting for your approval
     pact approve [ID] [--yes] approve exactly what is shown (the only pending one if ID is omitted)
     pact deny ID [REASON]     deny a pending payment
@@ -108,7 +109,7 @@ def _demo(args) -> int:
 
     settings = _settings()
     print("PACT demo setup")
-    problems = [c for c in ops.run_doctor(settings, check_mcp=False) if c.name in
+    problems = [c for c in ops.run_doctor(settings, check_mcp=False, check_order=False) if c.name in
                 (".env file", "Admin token", "PayPal Sandbox credentials") and not c.ok]
     if problems:
         print(ops.format_checks(problems)[0])
