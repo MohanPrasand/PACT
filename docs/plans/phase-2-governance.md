@@ -2,6 +2,24 @@
 
 Tracking: epic #18 · Integration branch: `feat/phase-2-governance` · Spec: §7.3, §7.5, §8, §9, §12, §14.2–14.3
 
+## Outcome — ✅ completed 2026-11-12
+
+| Wave | Issue | PR | Result |
+|---|---|---|---|
+| A | #6 Budget engine | #31 | 8 bugs fixed — incl. stale ORM reads (reported 100 reserved vs real 300), negative refunds, non-atomic release/settle on PostgreSQL (57 tests) |
+| A | #7 Grant manager | #29 | New module exactly per contract; atomic consume, check-order precedence (75 tests) |
+| A | #9 Merchant Lab | #30 | Seed catalogue; strict payment-status transitions; 7 bugs fixed (140 tests) |
+| A | #11 Adapters | #32 | Strict sandbox URL check, 401 re-auth, secret redaction, order-id path-injection guard; simulation thread-safety (193 tests) |
+| B | #8 + #10 Authorization service, execution gateway, `PactCore` | #33 | Full governed flow; 50 tests incl. concurrency, replay, timeouts after side effects |
+
+**1151 tests** passing. Verified live against PayPal Sandbox through `PactCore` up to buyer approval (order created, reconciled on status poll).
+
+**Carried into Phase 5 (#12/#13)**
+- REST: `/payments/return|cancel` → `PactCore.handle_provider_return|cancel`; simulated checkout page using `SimulationAdapter.buyer_approve|buyer_cancel`; admin auth; agent keys must get 403 on admin routes
+- `pact init` → `merchant_lab.seed.seed_catalogue`, `pact_core.seed.seed_policies|seed_agents`
+- Background expiry sweeper → `PactCore.expire_stale()` every `PACT_EXPIRY_SWEEP_SECONDS`
+- Merchant Lab items accept only `product_id` + `quantity`
+
 ## Goal
 Build the governance building blocks that the authorization service and execution gateway compose:
 

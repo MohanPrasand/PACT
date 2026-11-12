@@ -6,7 +6,7 @@
 AI Agent → MCP → PACT Policy Engine → Shared Budget → Human Approval → Restricted Grant → PayPal Sandbox → Audit
 ```
 
-> **Status:** in development for the PayPal AI Hackathon. Phase 1 (core foundation) is merged; Phase 2 (budget, grants, authorization service) is next. See the [roadmap](#roadmap) and [epic #18](https://github.com/MohanPrasand/PACT/issues/18).
+> **Status:** in development for the PayPal AI Hackathon. Phases 1–2 are complete: the full governed payment flow (policy → shared budget → human approval → single-use grant → PayPal Sandbox → audit) works in the core and has been verified live against PayPal Sandbox up to buyer approval. Next: REST API and MCP server. See the [roadmap](#roadmap) and [epic #18](https://github.com/MohanPrasand/PACT/issues/18).
 
 ---
 
@@ -98,14 +98,18 @@ A provider timeout moves a payment to `UNKNOWN`. It is reconciled against the pr
 | Authorization state machine (compare-and-set transitions) | ✅ merged | `pact_core/state_machine.py` |
 | Deterministic, fail-closed policy engine | ✅ merged | `pact_core/policy/` |
 | Tamper-evident audit log | ✅ merged | `pact_core/audit.py` |
-| Shared budget engine, grants, authorization service | 🚧 Phase 2 (#6–#8) | draft on `feat/core-foundation` |
-| Merchant Lab | 🚧 Phase 3 (#9) | draft on `feat/core-foundation` |
-| Execution gateway, PayPal Sandbox adapter | 🚧 Phase 4 (#10–#11) | draft on `feat/core-foundation` |
+| Shared budget engine (atomic reservations, ledger, refunds) | ✅ merged | `pact_core/budget.py` |
+| Grant manager (single-use, hashed, transaction-bound) | ✅ merged | `pact_core/grants.py` |
+| Authorization service (request, approve, deny, revoke, expire) | ✅ merged | `pact_core/authorization.py` |
+| Execution gateway (validation chain, UNKNOWN + reconciliation) | ✅ merged | `pact_core/gateway.py` |
+| `PactCore` entry point for REST/MCP | ✅ merged | `pact_core/core.py` |
+| Merchant Lab (catalogue, cart, orders, payment status, seed) | ✅ merged | `merchant_lab/` |
+| PayPal Sandbox adapter (Orders v2) + simulation adapter | ✅ merged | `adapters/` |
 | REST API, MCP server | ⏳ Phase 5 (#12–#13) | |
 | Dashboard and storefront UI | ⏳ Phase 6 (#14, #22–#25) | |
 | E2E demo, security review, deployment | ⏳ Phase 7 (#15–#17) | |
 
-PayPal Sandbox connectivity has been verified (OAuth, order creation and retrieval in USD). INR is rejected by PayPal for this account type (`CURRENCY_NOT_SUPPORTED`), so the demo settles in **USD**.
+PayPal Sandbox has been verified live (OAuth, order creation, retrieval, and a full PACT-governed request → approval → grant → PayPal order run). INR is rejected by PayPal for this account type (`CURRENCY_NOT_SUPPORTED`), so the demo settles in **USD**.
 
 ## Policy model
 
@@ -134,15 +138,19 @@ Reference and example documents: [`specification/policies/`](specification/polic
 ## Repository layout
 
 ```
-pact_core/            PACT Core: config, db, models, state machine, policy engine, audit
+pact_core/            PACT Core: config, db, models, state machine, policy engine, audit,
+                      budget, grants, authorization service, execution gateway, PactCore
   policy/             rule schemas + deterministic engine
+merchant_lab/         simulated commerce: catalogue, cart, orders, payment status, seed data
+adapters/             payment adapters: paypal/ (Orders API v2, Sandbox only), simulation/
+examples/             paypal_sandbox_check.py (live credential check)
 specification/        project spec, policy reference and example policies
 docs/                 architecture and implementation plans
 tests/                pytest suite
 .github/workflows/    CI
 ```
 
-Planned (later phases): `pact_server/` (REST API + CLI), `pact_mcp/` (MCP server), `merchant_lab/`, `adapters/paypal`, `adapters/simulation`, `dashboard/` (React UI for the admin dashboard and storefront), `examples/claude_code/`.
+Planned (later phases): `pact_server/` (REST API + CLI), `pact_mcp/` (MCP server), `dashboard/` (React UI for the admin dashboard and storefront), `examples/claude_code/`.
 
 ## Development
 
@@ -160,12 +168,17 @@ Tests never read `.env` and need no PayPal credentials. CI (`.github/workflows/c
 
 | Area | Tests |
 |---|---:|
-| Policy engine (`tests/test_policy_engine.py`) | 218 |
-| State machine (`tests/test_state_machine.py`) | 317 |
-| Configuration (`tests/test_config.py`) | 53 |
-| Audit log (`tests/test_audit.py`) | 42 |
-| Persistence and concurrency (`tests/test_db.py`) | 6 |
-| **Total** | **636** |
+| State machine | 317 |
+| Policy engine | 218 |
+| PayPal + simulation adapters | 193 |
+| Merchant Lab | 140 |
+| Grant manager | 75 |
+| Budget engine | 57 |
+| Configuration | 53 |
+| Authorization service + execution gateway | 50 |
+| Audit log | 42 |
+| Persistence and concurrency | 6 |
+| **Total** | **1151** |
 
 ### Branching
 
@@ -201,10 +214,8 @@ Settings are read from environment variables or `.env` (see `.env.example`). Inv
 | Phase | Scope | Issues | Status |
 |---|---|---|---|
 | 1 | Core foundation | #1–#5 | ✅ done |
-| 2 | Budget, grants, authorization service | #6, #7, #8 | next |
-| 3 | Merchant Lab | #9 | |
-| 4 | Execution gateway, PayPal Sandbox | #10, #11 | |
-| 5 | REST API, MCP server | #12, #13 | |
+| 2 | Budget, grants, authorization service, execution gateway (+ Merchant Lab, adapters pulled forward) | #6–#11 | ✅ done |
+| 5 | REST API, MCP server | #12, #13 | next |
 | 6 | Dashboard, storefront UI | #14, #22–#25 | |
 | 7 | E2E demo, security review, deployment, video | #15, #16, #17 | |
 
