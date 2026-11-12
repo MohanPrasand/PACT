@@ -6,9 +6,20 @@
 AI Agent → MCP → PACT Policy Engine → Shared Budget → Human Approval → Restricted Grant → PayPal Sandbox → Audit
 ```
 
-> **Status:** in development for the PayPal AI Hackathon. Phases 1–2 are complete: the full governed payment flow (policy → shared budget → human approval → single-use grant → PayPal Sandbox → audit) works in the core and has been verified live against PayPal Sandbox up to buyer approval. Next: REST API and MCP server. See the [roadmap](#roadmap) and [epic #18](https://github.com/MohanPrasand/PACT/issues/18).
+> **Status:** in development for the PayPal AI Hackathon. Phases 1–2 are complete: the full governed payment flow (policy → shared budget → human approval → single-use grant → PayPal Sandbox → audit) works in the core and has been verified live against PayPal Sandbox up to buyer approval. The REST API, CLI and MCP server are in place, so Claude Code can run the whole purchase. Next: dashboard and storefront UI. See the [roadmap](#roadmap) and [epic #18](https://github.com/MohanPrasand/PACT/issues/18).
 
 ---
+
+## Quick start
+
+```bash
+uv sync
+cp .env.example .env     # set PACT_ADMIN_TOKEN; for PayPal: PAYPAL_CLIENT_ID/SECRET + PACT_PAYMENT_PROVIDER=paypal
+uv run pact init         # seed catalogue, policies and demo agents (agent keys -> .pact/agent_keys.json)
+uv run pact serve        # API on http://localhost:8000, docs at /docs
+```
+
+Connect Claude Code and ask it to *"find the best mechanical keyboard under $100 and buy it"*: see [`examples/claude_code/`](examples/claude_code/README.md).
 
 ## Why PACT
 
@@ -105,7 +116,8 @@ A provider timeout moves a payment to `UNKNOWN`. It is reconciled against the pr
 | `PactCore` entry point for REST/MCP | ✅ merged | `pact_core/core.py` |
 | Merchant Lab (catalogue, cart, orders, payment status, seed) | ✅ merged | `merchant_lab/` |
 | PayPal Sandbox adapter (Orders v2) + simulation adapter | ✅ merged | `adapters/` |
-| REST API, MCP server | ⏳ Phase 5 (#12–#13) | |
+| REST API, CLI (`pact init/serve/verify-audit`), PayPal return/cancel routes | ✅ | `pact_server/` |
+| MCP server (15 tools, no approval tool) | ✅ | `pact_mcp/` |
 | Dashboard and storefront UI | ⏳ Phase 6 (#14, #22–#25) | |
 | E2E demo, security review, deployment | ⏳ Phase 7 (#15–#17) | |
 
@@ -143,14 +155,16 @@ pact_core/            PACT Core: config, db, models, state machine, policy engin
   policy/             rule schemas + deterministic engine
 merchant_lab/         simulated commerce: catalogue, cart, orders, payment status, seed data
 adapters/             payment adapters: paypal/ (Orders API v2, Sandbox only), simulation/
-examples/             paypal_sandbox_check.py (live credential check)
+pact_server/          REST API (FastAPI) and `pact` CLI
+pact_mcp/             MCP server for Claude Code (thin client, agent key only)
+examples/             claude_code/ setup, paypal_sandbox_check.py (live credential check)
 specification/        project spec, policy reference and example policies
 docs/                 architecture and implementation plans
 tests/                pytest suite
 .github/workflows/    CI
 ```
 
-Planned (later phases): `pact_server/` (REST API + CLI), `pact_mcp/` (MCP server), `dashboard/` (React UI for the admin dashboard and storefront), `examples/claude_code/`.
+Planned (later phases): `dashboard/` (React UI for the admin dashboard and storefront), `examples/claude_code/`.
 
 ## Development
 
@@ -176,9 +190,10 @@ Tests never read `.env` and need no PayPal credentials. CI (`.github/workflows/c
 | Budget engine | 57 |
 | Configuration | 53 |
 | Authorization service + execution gateway | 50 |
+| REST API + MCP server | 23 |
 | Audit log | 42 |
 | Persistence and concurrency | 6 |
-| **Total** | **1151** |
+| **Total** | **1174** |
 
 ### Branching
 
@@ -215,8 +230,8 @@ Settings are read from environment variables or `.env` (see `.env.example`). Inv
 |---|---|---|---|
 | 1 | Core foundation | #1–#5 | ✅ done |
 | 2 | Budget, grants, authorization service, execution gateway (+ Merchant Lab, adapters pulled forward) | #6–#11 | ✅ done |
-| 5 | REST API, MCP server | #12, #13 | next |
-| 6 | Dashboard, storefront UI | #14, #22–#25 | |
+| 5 | REST API, MCP server | #12, #13 | ✅ done |
+| 6 | Dashboard, storefront UI | #14, #22–#25 | next |
 | 7 | E2E demo, security review, deployment, video | #15, #16, #17 | |
 
 ## Positioning

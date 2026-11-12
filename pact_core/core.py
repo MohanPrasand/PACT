@@ -147,6 +147,26 @@ class PactCore:
         with self.db.transaction() as s:
             return audit_log.verify_chain(s)
 
+    def list_agents(self) -> list[dict]:
+        """Agents with today's spend against their own cap. API key hashes are never exposed."""
+        budgets = {s["scope"]: s for s in self.budget_status()["scopes"]}
+        with self.db.transaction() as s:
+            return [{"agent_id": a.id, "name": a.name, "description": a.description, "user_id": a.user_id,
+                     "active": a.active, "created_at": a.created_at.isoformat() + "Z",
+                     "budget": budgets.get(f"agent:{a.id}")}
+                    for a in s.execute(select(Agent).order_by(Agent.id)).scalars()]
+
+    def overview(self) -> dict[str, Any]:
+        with self.db.transaction() as s:
+            from sqlalchemy import func
+
+            counts = dict(s.execute(select(AuthorizationRequest.state, func.count())
+                                    .group_by(AuthorizationRequest.state)).all())
+        return {"currency": self.ctx.currency, "provider": self.ctx.provider,
+                "budgets": self.budget_status()["scopes"], "agents": self.list_agents(),
+                "requests_by_state": counts, "pending_approvals": counts.get(State.PENDING_APPROVAL.value, 0),
+                "recent": self.list_requests(limit=10), "audit": self.verify_audit()}
+
     def list_policies(self) -> list[dict]:
         with self.db.transaction() as s:
             return [{"id": p.id, "scope": p.scope, "subject": p.subject, "rules": p.rules, "version": p.version,
