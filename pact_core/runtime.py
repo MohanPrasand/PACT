@@ -43,6 +43,7 @@ class PactContext:
     budget: BudgetEngine = field(init=False)
     grants: GrantManager = field(init=False)
     grant_ttl_seconds: int = 600
+    checkout_ttl_seconds: int = 3600  # 0 disables the checkout timeout
 
     def __post_init__(self) -> None:
         if self.provider not in self.adapters:
@@ -110,8 +111,17 @@ def next_action(req: AuthorizationRequest, grant: Grant | None) -> str:
         return (f"Call pact_execute_action with the grant_token and the exact same order, merchant, amount and "
                 f"currency before {exp}. The grant works once.")
     if state == State.EXECUTING:
-        if req.approval_url and req.provider_status in (None, "CREATED", "PAYER_ACTION_REQUIRED", "INSTRUMENT_DECLINED"):
-            return (f"Ask the user to complete checkout at approval_url ({PROVIDER_LABELS.get(req.provider or '', req.provider)}). "
+        label = PROVIDER_LABELS.get(req.provider or "", req.provider)
+        if req.approval_url and req.provider_status == "BUYER_CANCELLED":
+            return (f"The buyer backed out of checkout; nothing was charged and the payment is still open. They can "
+                    f"retry at the same approval_url ({label}); do not start a new purchase. Then poll "
+                    "pact_get_authorization_status.")
+        if req.approval_url and req.provider_status == "INSTRUMENT_DECLINED":
+            return (f"The payment method was declined; nothing was charged. Ask the user to choose another payment "
+                    f"method at the same approval_url ({label}); do not start a new purchase. Then poll "
+                    "pact_get_authorization_status.")
+        if req.approval_url and req.provider_status in (None, "CREATED", "PAYER_ACTION_REQUIRED"):
+            return (f"Ask the user to complete checkout at approval_url ({label}). "
                     "PACT captures the payment after the buyer approves; then poll pact_get_authorization_status.")
         return "Payment in progress. Poll pact_get_authorization_status."
     if state == State.UNKNOWN:

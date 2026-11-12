@@ -145,6 +145,12 @@ def test_event_type_enum_covers_issue_minimum():
     assert required <= {e.value for e in EventType}
 
 
+def test_event_type_enum_covers_checkout_lifecycle():
+    assert {"CHECKOUT_CANCELLED_BY_BUYER", "CHECKOUT_TIMED_OUT"} <= {e.value for e in EventType}
+    assert EventType.CHECKOUT_CANCELLED_BY_BUYER == "CHECKOUT_CANCELLED_BY_BUYER"
+    assert all(len(e.value) <= 48 for e in EventType)  # pact_audit_events.event_type is String(48)
+
+
 def test_enum_and_plain_string_event_types_hash_identically(db, clock):
     with db.transaction() as s:
         a = append(s, clock, EventType.GRANT_ISSUED, actor="system")
