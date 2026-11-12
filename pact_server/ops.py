@@ -324,8 +324,9 @@ class ApprovalClient:
         return self._json(self.http.post(f"/admin/authorizations/{request_id}/approve",
                                          json={"request_hash": request_hash, "note": note}))
 
-    def cancel(self, request_id: str) -> dict:
-        return self._json(self.http.post(f"/admin/authorizations/{request_id}/cancel"))
+    def cancel(self, request_id: str, *, force: bool = False) -> dict:
+        return self._json(self.http.post(f"/admin/authorizations/{request_id}/cancel",
+                                         params={"force": "true"} if force else None))
 
     def stuck(self) -> list[dict]:
         out = []

@@ -301,8 +301,9 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
         return core.admin_revoke(admin, request_id)
 
     @app.post("/admin/authorizations/{request_id}/cancel", tags=["admin"])
-    def cancel_payment(request_id: str, admin: str = Depends(admin_auth)):
-        return core.cancel_payment(admin, request_id)
+    def cancel_payment(request_id: str, force: bool = False, admin: str = Depends(admin_auth)):
+        """``force=true`` closes a payment PACT cannot verify, without provider evidence (audited)."""
+        return core.cancel_payment(admin, request_id, force=force)
 
     @app.post("/admin/authorizations/{request_id}/reconcile", tags=["admin"])
     def reconcile(request_id: str, _admin: str = Depends(admin_auth)):
@@ -435,9 +436,11 @@ async def _form_token(request: Request) -> str:
     declared = request.headers.get("content-length", "")
     if declared.isdigit() and int(declared) > _FORM_MAX_BYTES:
         raise invalid("Form body too large")
-    raw = await request.body()
-    if len(raw) > _FORM_MAX_BYTES:
-        raise invalid("Form body too large")
+    raw = b""
+    async for chunk in request.stream():  # stop reading as soon as the limit is passed (chunked uploads too)
+        raw += chunk
+        if len(raw) > _FORM_MAX_BYTES:
+            raise invalid("Form body too large")
     try:
         values = parse_qs(raw.decode("utf-8"), keep_blank_values=True, max_num_fields=8).get("token", [])
     except ValueError:  # not UTF-8, or too many fields

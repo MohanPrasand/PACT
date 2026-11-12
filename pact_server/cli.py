@@ -226,7 +226,7 @@ def _cancel(args) -> int:
         print("\nCancel with:  pact cancel <request_id>")
         return 0
     try:
-        result = client.cancel(args.request_id)
+        result = client.cancel(args.request_id, force=args.force)
     except RuntimeError as exc:
         print(f"✗ {exc}")
         return 1
@@ -278,6 +278,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("cancel", help="cancel a payment stuck in checkout")
     p.add_argument("request_id", nargs="?")
+    p.add_argument("--force", action="store_true",
+                   help="close a payment PACT cannot verify, WITHOUT asking the provider: check the PayPal "
+                        "account by hand first; this releases the budget even if money was captured")
     p.set_defaults(func=_cancel)
 
     p = sub.add_parser("init", help="create tables and seed demo data")

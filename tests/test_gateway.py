@@ -563,7 +563,8 @@ def test_cancel_link_with_provider_unreachable_releases_nothing(env):
     order, view, token, v = start(env)
     env.sim.inject("get", "timeout")
     r = env.core.handle_provider_cancel(v["execution"]["provider_order_id"])
-    assert r["state"] == "UNKNOWN" and r["execution"]["failure_reason"] == "CANCEL_UNVERIFIED"
+    # The provider could not be asked, so nothing was learned and nothing changes.
+    assert r["state"] == "EXECUTING" and r["execution"]["failure_reason"] is None
     assert org(env)["reserved_minor"] == 7900
     assert env.core.reconcile(view["request_id"])["state"] == "EXECUTING"
     assert_consistent(env)

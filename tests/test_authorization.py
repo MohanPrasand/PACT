@@ -439,25 +439,23 @@ def test_checkout_timeout_never_touches_unknown_requests(env, monkeypatch):
     assert_consistent(env)
 
 
-def test_checkout_timeout_leaves_unknown_capture_outcome_for_manual_review(env, monkeypatch):
-    """A capture call with an unknown outcome may have moved money. Even back in EXECUTING, such a request
-    is never timed out and its failure reason is kept."""
+def test_unknown_capture_outcome_is_settled_by_the_capture_not_by_a_lookup_or_the_timeout(env, monkeypatch):
+    """A capture call with an unknown outcome may have moved money. A lookup that says "not approved" can lag
+    behind the capture, so it settles nothing; the timeout never touches the request. The capture is asked
+    again with the same key, and its answer decides."""
     order, rid, poid = checkout(env)
     env.sim.buyer_approve(poid)
-    env.sim.inject("capture", "timeout")
+    env.sim.inject("capture", "timeout", after_side_effect=True)  # the provider took the money
     assert env.core.handle_provider_return(poid)["state"] == "UNKNOWN"
-    # The provider then reports the order as still waiting for the buyer: back to EXECUTING, reason kept.
-    monkeypatch.setattr(env.sim, "get_order",
-                        lambda p: ProviderOrder(provider_order_id=p, status="PAYER_ACTION_REQUIRED"))
-    assert env.core.reconcile(rid)["state"] == "EXECUTING"
-    assert state_of(env, rid) == ("EXECUTING", "PROVIDER_TIMEOUT_ON_CAPTURE")
-
-    lookups = []
-    monkeypatch.setattr(env.sim, "get_order", lambda p: lookups.append(p))
     env.clock.advance(seconds=7200)
     assert env.core.expire_stale() == []
-    assert state_of(env, rid) == ("EXECUTING", "PROVIDER_TIMEOUT_ON_CAPTURE") and lookups == []
+    assert state_of(env, rid) == ("UNKNOWN", "PROVIDER_TIMEOUT_ON_CAPTURE")
     assert scope(env, "org:global")["reserved_minor"] == 7900
+
+    monkeypatch.setattr(env.sim, "get_order",
+                        lambda p: ProviderOrder(provider_order_id=p, status="PAYER_ACTION_REQUIRED"))
+    assert env.core.reconcile(rid)["state"] == "EXECUTED"
+    assert scope(env, "org:global")["settled_minor"] == 7900
     assert "EXECUTION_FAILED" not in events(env, rid)
     assert_consistent(env)
 

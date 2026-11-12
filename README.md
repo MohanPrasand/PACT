@@ -129,11 +129,11 @@ While a request is `EXECUTING` the buyer is at the provider's checkout page. Can
 | PayPal Sandbox adapter (Orders v2) + simulation adapter. Live-verified: OAuth, create order, get order. Capture: mocked tests only | ✅ merged | `adapters/` |
 | REST API, CLI (`pact init/serve/verify-audit`), PayPal return/cancel routes (exercised with the simulation adapter and mocked PayPal, not yet by a live PayPal buyer) | ✅ | `pact_server/` |
 | MCP server (16 tools incl. `pact_wait_for_status`; no approval tool) | ✅ | `pact_mcp/` |
-| Operator CLI: `pact demo`, `doctor` (PayPal mode: OAuth + one unpaid test order), `approve`, `cancel`, `stop`, server lock | ✅ | `pact_server/cli.py`, `pact_server/ops.py` |
+| Operator CLI: `pact demo`, `doctor` (PayPal mode: OAuth + one unpaid test order), `approve`, `cancel` (`--force` for a payment PACT cannot verify), `stop`, server lock | ✅ | `pact_server/cli.py`, `pact_server/ops.py` |
 | Dashboard and storefront UI | ⏳ Phase 6 (#14, #22–#25) | |
 | E2E demo, security review, deployment | ⏳ Phase 7 (#15–#17) | |
 
-**What has been verified live against PayPal Sandbox:** OAuth, order creation and order retrieval, including a PACT-governed request → human approval in PACT → grant → PayPal order creation. **What has not:** no PayPal-mode payment has yet reached buyer approval on PayPal's page or capture. The return, cancel, capture, settlement and reconciliation paths are tested against the simulation adapter and a mocked PayPal API only. INR is rejected by PayPal for this account type (`CURRENCY_NOT_SUPPORTED`), so the demo settles in **USD**.
+**What has been verified live against PayPal Sandbox:** OAuth, order creation and order retrieval, including a PACT-governed request → human approval in PACT → grant → PayPal order creation. Also run live against real PayPal orders: an early return before approval, the non-terminal cancel link, the explicit buyer cancel, quiet status polling, order-not-found, and the checkout timeout. **What has not:** no PayPal-mode payment has yet reached buyer approval on PayPal's page or capture. Capture, decline, settlement and the unknown-outcome paths are tested against the simulation adapter and a mocked PayPal API only. INR is rejected by PayPal for this account type (`CURRENCY_NOT_SUPPORTED`), so the demo settles in **USD**.
 
 ## Policy model
 
@@ -200,15 +200,15 @@ Tests never read `.env` and need no PayPal credentials. CI (`.github/workflows/c
 | Merchant Lab | 140 |
 | Grant manager | 75 |
 | Budget engine | 57 |
-| Configuration | 62 |
-| Authorization service + execution gateway | 61 |
-| REST API + MCP server | 24 |
+| Configuration | 69 |
+| Authorization service + execution gateway (incl. capture money-safety regressions) | 110 |
+| REST API + MCP server | 59 |
 | Demo convenience (wait tool, CLI, doctor, lock) | 24 |
-| Audit log | 42 |
+| Audit log | 43 |
 | Persistence and concurrency | 6 |
-| **Total** | **1238** |
+| **Total** | **1330** |
 
-Counts are per test file, collected on the `fix/paypal-gateway` integration branch at `9aa4730` plus the MCP instruction test added with this README update. The checkout lifecycle work (#40–#42) adds tests that are not counted here.
+Counts are per test file, measured on the `fix/paypal-gateway` branch with all of #38–#43 merged.
 
 ### Branching
 

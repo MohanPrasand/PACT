@@ -138,8 +138,8 @@ class PactCore:
     def admin_revoke(self, admin: str, request_id: str) -> dict[str, Any]:
         return self.auth.revoke(request_id, admin=admin)
 
-    def cancel_payment(self, admin: str, request_id: str) -> dict[str, Any]:
-        return self.gateway.abandon(request_id, f"admin:{admin}")
+    def cancel_payment(self, admin: str, request_id: str, *, force: bool = False) -> dict[str, Any]:
+        return self.gateway.abandon(request_id, f"admin:{admin}", force=force)
 
     def reconcile(self, request_id: str) -> dict[str, Any]:
         return self.gateway.reconcile(request_id)
