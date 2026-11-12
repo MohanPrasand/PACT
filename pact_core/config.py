@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+MIN_ADMIN_TOKEN_LENGTH = 16
+_PLACEHOLDER_TOKEN_PARTS = ("change-me", "changeme", "placeholder", "your-token", "your_token", "example")
 _CURRENCY_RE = re.compile(r"[A-Z]{3}")
 # Hosts that can only ever reach a local mock/test server, never real PayPal.
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "testserver"})
@@ -43,6 +45,21 @@ class Settings(BaseSettings):
     paypal_client_secret: SecretStr | None = Field(None, alias="PAYPAL_CLIENT_SECRET")
     paypal_base_url: str = Field("https://api-m.sandbox.paypal.com", alias="PAYPAL_BASE_URL")
     paypal_timeout_seconds: float = Field(15.0, alias="PAYPAL_TIMEOUT_SECONDS")
+
+    @field_validator("admin_token")
+    @classmethod
+    def _admin_token_is_strong(cls, value: SecretStr | None) -> SecretStr | None:
+        """The admin token approves payments and edits policy: refuse short or placeholder values (SEC-4).
+        The message never includes the value."""
+        if value is None:
+            return value
+        token = value.get_secret_value()
+        lowered = token.lower()
+        if len(token) < MIN_ADMIN_TOKEN_LENGTH or any(p in lowered for p in _PLACEHOLDER_TOKEN_PARTS):
+            raise ValueError(
+                f"PACT_ADMIN_TOKEN must be at least {MIN_ADMIN_TOKEN_LENGTH} characters and not a placeholder. "
+                'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"')
+        return value
 
     @field_validator("currency")
     @classmethod
