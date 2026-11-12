@@ -6,27 +6,27 @@
 AI Agent → MCP → PACT Policy Engine → Shared Budget → Human Approval → Restricted Grant → PayPal Sandbox → Audit
 ```
 
-> **Status:** in development for the PayPal AI Hackathon. Phases 1–2 are complete: the full governed payment flow (policy → shared budget → human approval → single-use grant → payment provider → audit) works in the core and runs end to end with the simulation adapter. Against the live PayPal Sandbox, only OAuth, order creation and order retrieval have been verified; no PayPal-mode payment has yet reached buyer approval or capture, so those steps are covered by automated tests with a mocked PayPal only. The REST API, CLI and MCP server are in place, so Claude Code can run the whole purchase in simulation mode. Next: dashboard and storefront UI. See the [roadmap](#roadmap) and [epic #18](https://github.com/MohanPrasand/PACT/issues/18).
+> **Status:** hackathon MVP for the PayPal AI Hackathon. The full governed payment flow (policy → shared budget → human approval → single-use grant → PayPal Sandbox → audit) is implemented and tested end to end, with an admin dashboard, a Merchant Lab storefront, a REST API, an MCP server for Claude Code and an operator CLI. A complete live PayPal Sandbox capture has not been recorded yet (see [Limitations](#limitations)). See the [roadmap](#roadmap) and [epic #18](https://github.com/MohanPrasand/PACT/issues/18).
 
 ---
 
 ## Quick start
 
-```bash
-uv sync
-cp .env.example .env     # set PACT_ADMIN_TOKEN; for PayPal: PAYPAL_CLIENT_ID/SECRET + PACT_PAYMENT_PROVIDER=paypal
-uv run pact demo         # checks config, seeds data, registers the MCP server for ~/pact-shopper, starts PACT
-```
-
-Then, in another terminal:
+Requires [uv](https://docs.astral.sh/uv/) (Python 3.11+) and Node 20+ (for the dashboard build).
 
 ```bash
-cd ~/pact-shopper && claude      # ask: "Find the best mechanical keyboard under $100 and buy it."
-uv run pact approve              # (from the PACT repo) when Claude says it is waiting for your approval
+uv sync                                   # Python dependencies
+cp .env.example .env                      # then set PACT_ADMIN_TOKEN (see below)
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # use this as PACT_ADMIN_TOKEN
+(cd dashboard && npm ci && npm run build) # dashboard + storefront, served by the API
+uv run pact demo                          # seed data, register Claude Code MCP, start the server
 ```
 
-Open the checkout link Claude gives you and pay. Claude waits for both human steps and confirms the purchase by itself.
-Anything off? `uv run pact doctor` tells you what and how to fix it. Details: [`examples/claude_code/`](examples/claude_code/README.md).
+With `PACT_PAYMENT_PROVIDER=simulation` (the default) no PayPal account is needed and every payment is labelled "Simulation (not PayPal)". For PayPal Sandbox, add the credentials of a Sandbox REST app and set the provider to `paypal`.
+
+Then, in the shopper workspace that `pact demo` prepares, ask Claude: *"Find the best mechanical keyboard under $100 and purchase it."* Approve in the dashboard at <http://localhost:8000/#/admin> (or `uv run pact approve`) and watch the order at <http://localhost:8000/#/shop>. Claude waits for both human steps (approval, then PayPal checkout) and confirms the purchase by itself. Run `uv run pact doctor` if anything looks wrong; details for Claude Code are in [`examples/claude_code/`](examples/claude_code/README.md). The full walkthrough, including the replay-rejection and multi-agent moments, is in [`docs/DEMO.md`](docs/DEMO.md).
+
+---
 
 **PayPal mode.** You need a Sandbox business account, a REST app created under it, and a separate personal Sandbox account for the buyer: see [`docs/paypal-sandbox-setup.md`](docs/paypal-sandbox-setup.md). In PayPal mode `pact doctor` gets an OAuth token and then creates one small test order that nobody pays. It prints the business account that will receive the money and reminds you that the buyer must log in with a different, personal Sandbox account. A passing doctor shows the app and the business account work; it does not test the buyer login, approval or capture.
 
@@ -130,8 +130,11 @@ While a request is `EXECUTING` the buyer is at the provider's checkout page. Can
 | REST API, CLI (`pact init/serve/verify-audit`), PayPal return/cancel routes (exercised with the simulation adapter and mocked PayPal, not yet by a live PayPal buyer) | ✅ | `pact_server/` |
 | MCP server (16 tools incl. `pact_wait_for_status`; no approval tool) | ✅ | `pact_mcp/` |
 | Operator CLI: `pact demo`, `doctor` (PayPal mode: OAuth + one unpaid test order), `approve`, `cancel` (`--force` for a payment PACT cannot verify), `stop`, server lock | ✅ | `pact_server/cli.py`, `pact_server/ops.py` |
-| Dashboard and storefront UI | ⏳ Phase 6 (#14, #22–#25) | |
-| E2E demo, security review, deployment | ⏳ Phase 7 (#15–#17) | |
+| Admin dashboard: overview, approval centre, policies, audit explorer (hash-chain verification) | ✅ | `dashboard/src/admin/` |
+| Merchant Lab storefront: catalogue, live cart, orders, order status stepper; web checkout governed by PACT | ✅ | `dashboard/src/shop/`, `pact_server/storefront.py` |
+| End-to-end acceptance tests (agent, shared budget, web checkout) and multi-agent demo script | ✅ | `tests/test_e2e.py`, `examples/multi_agent_demo.py` |
+| Security test matrix, threat model and findings | ✅ | `tests/test_security.py`, [`docs/SECURITY.md`](docs/SECURITY.md) |
+| Deployment, demo video | ⏳ Phase 7 (#17) | |
 
 **What has been verified live against PayPal Sandbox:** OAuth, order creation and order retrieval, including a PACT-governed request → human approval in PACT → grant → PayPal order creation. Also run live against real PayPal orders: an early return before approval, the non-terminal cancel link, the explicit buyer cancel, quiet status polling, order-not-found, and the checkout timeout. **What has not:** no PayPal-mode payment has yet reached buyer approval on PayPal's page or capture. Capture, decline, settlement and the unknown-outcome paths are tested against the simulation adapter and a mocked PayPal API only. INR is rejected by PayPal for this account type (`CURRENCY_NOT_SUPPORTED`), so the demo settles in **USD**.
 
@@ -167,16 +170,15 @@ pact_core/            PACT Core: config, db, models, state machine, policy engin
   policy/             rule schemas + deterministic engine
 merchant_lab/         simulated commerce: catalogue, cart, orders, payment status, seed data
 adapters/             payment adapters: paypal/ (Orders API v2, Sandbox only), simulation/
-pact_server/          REST API (FastAPI) and `pact` CLI
+pact_server/          REST API (FastAPI), storefront backend and `pact` CLI
 pact_mcp/             MCP server for Claude Code (thin client, agent key only)
-examples/             claude_code/ setup, paypal_sandbox_check.py (live credential check)
-specification/        project spec, policy reference and example policies
-docs/                 architecture, PayPal Sandbox setup guide and implementation plans
+dashboard/            React + Vite + Tailwind app: admin dashboard (#/admin) and storefront (#/shop)
+examples/             claude_code/ setup, multi_agent_demo.py, paypal_sandbox_check.py
+specification/        project spec, PROTOCOL.md, policy reference and example policies
+docs/                 architecture, DEMO.md, SECURITY.md, PayPal Sandbox setup guide and implementation plans
 tests/                pytest suite
 .github/workflows/    CI
 ```
-
-Planned (later phases): `dashboard/` (React UI for the admin dashboard and storefront), `examples/claude_code/`.
 
 ## Development
 
@@ -188,7 +190,7 @@ cp .env.example .env   # optional: only needed for PayPal Sandbox mode
 uv run pytest          # run the test suite
 ```
 
-Tests never read `.env` and need no PayPal credentials. CI (`.github/workflows/ci.yml`) runs `uv sync --locked` and `uv run pytest` on every push and pull request to `main`, `dev` and `feat/**`.
+Tests never read `.env` and need no PayPal credentials. Dashboard development: `cd dashboard && npm install && npm run dev` (proxies the API on port 8000); `npm run build` typechecks and builds to `dashboard/dist`. CI (`.github/workflows/ci.yml`) runs `uv sync --locked` + `uv run pytest` and `npm ci` + `npm run build` on every push and pull request to `main`, `dev` and `feat/**`.
 
 ### Test suite
 
@@ -201,15 +203,14 @@ Tests never read `.env` and need no PayPal credentials. CI (`.github/workflows/c
 | Grant manager | 75 |
 | Budget engine | 57 |
 | Configuration | 69 |
-| Authorization service + execution gateway (incl. capture money-safety regressions) | 111 |
-| REST API + MCP server | 59 |
-| Demo convenience (wait tool, CLI, doctor, lock) | 24 |
+| Security matrix (5 expected failures document open findings) | 49 |
 | Audit log | 43 |
+| Authorization service + execution gateway (incl. capture money-safety regressions) | 111 |
+| REST API, storefront, MCP server | 68 |
+| Demo convenience, keys file | 26 |
+| End-to-end acceptance | 3 |
 | Persistence and concurrency | 6 |
-| Storefront + agent keys file | 11 |
-| **Total** | **1343** |
-
-Counts are per test file, measured on the `fix/paypal-gateway` branch with all of #38–#43 merged.
+| **Total** | **1395** |
 
 ### Branching
 
@@ -234,7 +235,7 @@ Settings are read from environment variables or `.env` (see `.env.example`). Inv
 | `PAYPAL_LANDING_PAGE` | `LOGIN` | First page PayPal shows the buyer: `LOGIN` (PayPal login), `GUEST_CHECKOUT` (card form) or `NO_PREFERENCE` (PayPal decides) |
 | `PACT_PAYMENT_PROVIDER` | `simulation` | `simulation` or `paypal`; `paypal` requires both PayPal credentials |
 | `PACT_DATABASE_URL` | `sqlite:///./pact.db` | SQLAlchemy database URL |
-| `PACT_ADMIN_TOKEN` | — | Dashboard/approval bearer token; never given to agents |
+| `PACT_ADMIN_TOKEN` | — | Dashboard/approval bearer token (at least 16 characters, not a placeholder); never given to agents |
 | `PACT_CURRENCY` | `USD` | Settlement currency, 3-letter uppercase ISO 4217 code |
 | `PACT_PUBLIC_URL` | `http://localhost:8000` | Base URL for PayPal return/cancel redirects |
 | `PACT_GRANT_TTL_SECONDS` | `600` | Payment grant lifetime |
@@ -251,8 +252,9 @@ PayPal Sandbox account setup (business account, REST app, personal buyer account
 | 1 | Core foundation | #1–#5 | ✅ done |
 | 2 | Budget, grants, authorization service, execution gateway (+ Merchant Lab, adapters pulled forward) | #6–#11 | ✅ done |
 | 5 | REST API, MCP server | #12, #13 | ✅ done |
-| 6 | Dashboard, storefront UI | #14, #22–#25 | next |
-| 7 | E2E demo, security review, deployment, video | #15, #16, #17 | |
+| 6 | Dashboard, storefront UI | #14, #22–#25 | ✅ done |
+| 7 | E2E tests, security review | #15, #16 | ✅ done |
+| 7 | Live PayPal Sandbox run, deployment, demo video | #17 and bugs #38–#43 | in progress |
 
 ## Positioning
 
@@ -266,6 +268,13 @@ PACT operates alongside Google AP2, Visa Intelligent Commerce, Mastercard Agent 
 ## Limitations
 
 PACT is a sandbox reference implementation for a hackathon, not a certified financial security product. It processes no real money: only PayPal Sandbox endpoints are accepted.
+
+- **Merchant Lab and storefront routes are unauthenticated** (a sandbox commerce simulator). Web checkout can only start a PACT-governed request; it cannot approve, and approval stays in the admin dashboard.
+- **Known issues**, tracked in [`docs/SECURITY.md`](docs/SECURITY.md) and the issue tracker: the buyer's explicit cancel accepts a bare provider order id (rest of SEC-1; the cancel link itself no longer ends a payment, #40), missing framing headers and auth rate limiting (SEC-2, SEC-5), and no card payment path or card check in `pact doctor` (#43). The PayPal checkout bugs #38–#42 and SEC-4 (weak admin token) are fixed.
+- **PayPal Sandbox:** a complete live capture is not yet recorded; the buyer must use a Personal sandbox account that differs from the business account.
+- **Single instance:** SQLite with `BEGIN IMMEDIATE` serialisation; PostgreSQL is designed for but untested.
+
+Protocol reference: [`specification/PROTOCOL.md`](specification/PROTOCOL.md).
 
 ## License
 
