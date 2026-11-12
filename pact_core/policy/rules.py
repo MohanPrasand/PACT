@@ -1,5 +1,6 @@
 """Typed policy documents. Each scope has its own schema; unknown fields are rejected so a typo in
-a policy cannot silently disable a restriction."""
+a policy cannot silently disable a restriction. Validation is strict (no "5000" -> 5000 or
+true -> 1 coercion) and limits are integer minor units that may not be negative."""
 
 from __future__ import annotations
 
@@ -9,13 +10,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class _Rules(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class SystemPolicy(_Rules):
     """Hard restrictions. Human approval can never override these."""
 
-    currency: str = "USD"
+    currency: str = Field("USD", pattern=r"^[A-Z]{3}$")
     hard_max_transaction_minor: int = Field(100_000, ge=1)
     allowed_actions: list[str] = ["PURCHASE"]
 

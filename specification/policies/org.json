@@ -1,0 +1,7 @@
+{
+  "daily_budget_minor": 50000,
+  "approved_merchants": ["m_techmart", "m_datahub"],
+  "max_transaction_minor": null,
+  "duplicate_window_minutes": 10,
+  "duplicate_effect": "REQUIRE_APPROVAL"
+}

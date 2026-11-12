@@ -1,0 +1,6 @@
+{
+  "max_transaction_minor": 25000,
+  "allowed_categories": ["peripherals", "displays", "audio"],
+  "allowed_agents": null,
+  "approval_required_above_minor": null
+}

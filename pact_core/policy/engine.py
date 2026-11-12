@@ -7,7 +7,9 @@ or an LLM. Every applicable restriction produces a Finding; the final decision i
     else any REQUIRE_APPROVAL -> REQUIRE_APPROVAL
     else                  -> ALLOW
 
-Missing policy documents fail closed (DENY), as does any exception raised while evaluating.
+Missing (system/org/user/agent) or malformed policy documents fail closed (DENY), as does any
+exception raised while evaluating. The merchant document is optional: without one the merchant imposes
+no restrictions of its own. ``evaluate`` reads no clock; the decision depends only on its arguments.
 """
 
 from __future__ import annotations
@@ -16,10 +18,17 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from pact_core.crypto import canonical_json, sha256_hex
-from pact_core.policy.rules import AgentPolicy, MerchantPolicy, OrgPolicy, SystemPolicy, UserPolicy
+from pact_core.policy.rules import SCHEMAS, AgentPolicy, MerchantPolicy, OrgPolicy, SystemPolicy, UserPolicy
+
+#: Merchant Lab payment statuses (spec §8) from which an order may still be paid. APPROVED (in flight
+#: at the provider) and CAPTURED (already paid) are not payable.
+PAYABLE_ORDER_STATUSES = frozenset({"CREATED", "PENDING", "FAILED", "CANCELLED"})
+
+#: Evaluation order of the policy scopes; also the order of ``policies_evaluated``.
+SCOPES = ("system", "org", "user", "merchant", "agent")
 
 
 class Effect(StrEnum):
@@ -87,29 +96,65 @@ class EvaluationInput:
 
 @dataclass(frozen=True)
 class PolicySnapshot:
-    system: tuple[str, int, SystemPolicy] | None
-    org: tuple[str, int, OrgPolicy] | None
-    user: tuple[str, int, UserPolicy] | None
-    merchant: tuple[str, int, MerchantPolicy] | None
-    agent: tuple[str, int, AgentPolicy] | None
+    """The policy documents in force for one evaluation, each as ``(policy_id, version, rules)``.
+
+    ``rules`` is normally the typed model for its scope. A raw ``dict`` (as stored in the database) is
+    also accepted and validated during evaluation: a document that fails validation, or a model of the
+    wrong scope, yields ``<SCOPE>_POLICY_INVALID`` and the decision fails closed.
+    """
+
+    system: tuple[str, int, SystemPolicy | dict[str, Any]] | None
+    org: tuple[str, int, OrgPolicy | dict[str, Any]] | None
+    user: tuple[str, int, UserPolicy | dict[str, Any]] | None
+    merchant: tuple[str, int, MerchantPolicy | dict[str, Any]] | None
+    agent: tuple[str, int, AgentPolicy | dict[str, Any]] | None
+
+    def docs(self) -> list[tuple[str, tuple[str, int, Any] | None]]:
+        return [(scope, getattr(self, scope)) for scope in SCOPES]
 
     def refs(self) -> list[PolicyRef]:
-        return [PolicyRef(id=p[0], version=p[1]) for p in (self.system, self.org, self.user, self.merchant, self.agent) if p]
+        return [PolicyRef(id=d[0], version=d[1]) for _, d in self.docs() if d]
 
     def version(self) -> str:
-        parts = [(p[0], p[1], p[2].model_dump()) for p in (self.system, self.org, self.user, self.merchant, self.agent) if p]
+        """Content hash over every document's scope, id, version and (normalised) rules."""
+        parts = []
+        for scope, doc in self.docs():
+            if not doc:
+                continue
+            model = _coerce_rules(scope, doc[2])
+            rules = model.model_dump() if model is not None else doc[2]
+            parts.append((scope, doc[0], doc[1], rules))
         return sha256_hex(canonical_json(parts))[:16]
 
 
+def _coerce_rules(scope: str, rules: Any) -> BaseModel | None:
+    """Return ``rules`` as the typed model for ``scope``, or None if it is not a valid document."""
+    schema = SCHEMAS[scope]
+    if type(rules) is schema:
+        return rules
+    if isinstance(rules, dict):
+        try:
+            return schema.model_validate(rules)
+        except ValidationError:
+            return None
+    return None
+
+
 def budget_scopes(snapshot: PolicySnapshot, agent_id: str, user_id: str) -> list[tuple[str, int]]:
-    """The shared budgets a request draws from: (scope_key, limit). All must have headroom."""
+    """The shared budgets a request draws from: (scope_key, limit). All must have headroom.
+
+    Scopes whose document is missing or invalid are omitted; ``evaluate`` denies such requests anyway.
+    """
+    org = _coerce_rules("org", snapshot.org[2]) if snapshot.org else None
+    user = _coerce_rules("user", snapshot.user[2]) if snapshot.user else None
+    agent = _coerce_rules("agent", snapshot.agent[2]) if snapshot.agent else None
     scopes: list[tuple[str, int]] = []
-    if snapshot.org:
-        scopes.append(("org:global", snapshot.org[2].daily_budget_minor))
-    if snapshot.user:
-        scopes.append((f"user:{user_id}", snapshot.user[2].daily_limit_minor))
-    if snapshot.agent:
-        scopes.append((f"agent:{agent_id}", snapshot.agent[2].daily_limit_minor))
+    if org is not None:
+        scopes.append(("org:global", org.daily_budget_minor))
+    if user is not None:
+        scopes.append((f"user:{user_id}", user.daily_limit_minor))
+    if agent is not None:
+        scopes.append((f"agent:{agent_id}", agent.daily_limit_minor))
     return scopes
 
 
@@ -147,6 +192,8 @@ def _evaluate(f: EvaluationInput, p: PolicySnapshot) -> PolicyDecision:
     findings: list[Finding] = []
     cur = f.currency
     amt = f.amount_minor
+    if isinstance(amt, bool) or not isinstance(amt, int):
+        raise TypeError("amount_minor must be an integer number of minor units")
 
     def add(source: str, policy_id: str, rule: str, effect: Effect, code: str, message: str, limit=None, observed=None):
         findings.append(
@@ -156,15 +203,58 @@ def _evaluate(f: EvaluationInput, p: PolicySnapshot) -> PolicyDecision:
             )
         )
 
-    # ---- fail closed on missing policy documents -------------------------------------------
-    for name, doc in (("system", p.system), ("org", p.org), ("user", p.user), ("agent", p.agent)):
+    # ---- fail closed on missing or malformed policy documents -------------------------------
+    # The merchant document is optional: a merchant without one imposes no merchant restrictions.
+    docs: dict[str, tuple[str, int, Any] | None] = {}
+    for name, doc in p.docs():
+        docs[name] = None
         if doc is None:
-            add(name, f"{name}:?", "presence", Effect.DENY, f"{name.upper()}_POLICY_MISSING",
-                f"No {name} policy is configured; failing closed.")
+            if name != "merchant":
+                add(name, f"{name}:?", "presence", Effect.DENY, f"{name.upper()}_POLICY_MISSING",
+                    f"No {name} policy is configured; failing closed.")
+            continue
+        rules = _coerce_rules(name, doc[2])
+        if rules is None:
+            add(name, doc[0], "schema", Effect.DENY, f"{name.upper()}_POLICY_INVALID",
+                f"The {name} policy {doc[0]} v{doc[1]} is malformed; failing closed.")
+            continue
+        docs[name] = (doc[0], doc[1], rules)
 
-    # ---- system (hard) ---------------------------------------------------------------------
-    if p.system:
-        sid, _, sp = p.system
+    # ---- system integrity (always enforced, even without a usable system document) ----------
+    sid = p.system[0] if p.system else "system:?"
+    if not f.agent_active:
+        add("system", sid, "agent_identity", Effect.DENY, "AGENT_INACTIVE", "Agent is disabled.")
+    if not f.merchant_exists:
+        add("system", sid, "merchant_identity", Effect.DENY, "MERCHANT_UNKNOWN",
+            f"Merchant {f.merchant_id} is not a known merchant.")
+    if f.order is None:
+        add("system", sid, "order_binding", Effect.DENY, "ORDER_NOT_FOUND", f"Order {f.order_id} does not exist.")
+    else:
+        o = f.order
+        mismatches = []
+        if o.order_id != f.order_id:
+            mismatches.append("order")
+        if o.merchant_id != f.merchant_id:
+            mismatches.append("merchant")
+        if o.amount_minor != amt:
+            mismatches.append("amount")
+        if o.currency.upper() != cur.upper():
+            mismatches.append("currency")
+        if mismatches:
+            add("system", sid, "order_binding", Effect.DENY, "ORDER_MISMATCH",
+                f"Requested {', '.join(mismatches)} does not match merchant order {o.order_id} "
+                f"({_fmt(o.amount_minor, o.currency)} at {o.merchant_id}).",
+                o.amount_minor, amt)
+        if o.status.upper() not in PAYABLE_ORDER_STATUSES:
+            add("system", sid, "order_state", Effect.DENY, "ORDER_NOT_PAYABLE",
+                f"Order {o.order_id} is in status {o.status} and cannot be paid.")
+    if f.order_has_active_authorization:
+        add("system", sid, "duplicate_execution", Effect.DENY, "DUPLICATE_ORDER_AUTHORIZATION",
+            f"Order {f.order_id} already has an active or completed authorization.")
+
+    # ---- system (hard, configured) ------------------------------------------------------------
+    if docs["system"]:
+        sid, _, sp = docs["system"]
         if amt <= 0:
             add("system", sid, "amount", Effect.DENY, "INVALID_AMOUNT", "Amount must be positive.", observed=amt)
         if cur.upper() != sp.currency.upper():
@@ -177,36 +267,10 @@ def _evaluate(f: EvaluationInput, p: PolicySnapshot) -> PolicyDecision:
             add("system", sid, "hard_max_transaction", Effect.DENY, "SYSTEM_TRANSACTION_LIMIT",
                 f"{_fmt(amt, cur)} exceeds the system hard cap of {_fmt(sp.hard_max_transaction_minor, cur)}.",
                 sp.hard_max_transaction_minor, amt)
-        if not f.agent_active:
-            add("system", sid, "agent_identity", Effect.DENY, "AGENT_INACTIVE", "Agent is disabled.")
-        if not f.merchant_exists:
-            add("system", sid, "merchant_identity", Effect.DENY, "MERCHANT_UNKNOWN",
-                f"Merchant {f.merchant_id} is not a known merchant.")
-        if f.order is None:
-            add("system", sid, "order_binding", Effect.DENY, "ORDER_NOT_FOUND", f"Order {f.order_id} does not exist.")
-        else:
-            o = f.order
-            mismatches = []
-            if o.merchant_id != f.merchant_id:
-                mismatches.append("merchant")
-            if o.amount_minor != amt:
-                mismatches.append("amount")
-            if o.currency.upper() != cur.upper():
-                mismatches.append("currency")
-            if mismatches:
-                add("system", sid, "order_binding", Effect.DENY, "ORDER_MISMATCH",
-                    f"Requested {', '.join(mismatches)} does not match merchant order {o.order_id} "
-                    f"({_fmt(o.amount_minor, o.currency)} at {o.merchant_id}).")
-            if o.status not in ("CREATED", "PENDING", "FAILED", "CANCELLED"):
-                add("system", sid, "order_state", Effect.DENY, "ORDER_NOT_PAYABLE",
-                    f"Order {o.order_id} is in status {o.status} and cannot be paid.")
-        if f.order_has_active_authorization:
-            add("system", sid, "duplicate_execution", Effect.DENY, "DUPLICATE_ORDER_AUTHORIZATION",
-                f"Order {f.order_id} already has an active or completed authorization.")
 
     # ---- organisation ----------------------------------------------------------------------
-    if p.org:
-        oid, _, op = p.org
+    if docs["org"]:
+        oid, _, op = docs["org"]
         if f.merchant_id not in op.approved_merchants:
             add("org", oid, "approved_merchants", Effect.DENY, "MERCHANT_NOT_APPROVED",
                 f"Merchant {f.merchant_id} is not on the organisation's approved list.")
@@ -219,8 +283,8 @@ def _evaluate(f: EvaluationInput, p: PolicySnapshot) -> PolicyDecision:
                 f"{op.duplicate_window_minutes} minutes.")
 
     # ---- user ------------------------------------------------------------------------------
-    if p.user:
-        uid, _, up = p.user
+    if docs["user"]:
+        uid, _, up = docs["user"]
         if up.max_transaction_minor is not None and amt > up.max_transaction_minor:
             add("user", uid, "max_transaction", Effect.DENY, "USER_TRANSACTION_LIMIT",
                 f"{_fmt(amt, cur)} exceeds the user's per-transaction limit.", up.max_transaction_minor, amt)
@@ -230,8 +294,8 @@ def _evaluate(f: EvaluationInput, p: PolicySnapshot) -> PolicyDecision:
                 up.approval_threshold_minor, amt)
 
     # ---- merchant --------------------------------------------------------------------------
-    if p.merchant:
-        mid, _, mp = p.merchant
+    if docs["merchant"]:
+        mid, _, mp = docs["merchant"]
         if mp.max_transaction_minor is not None and amt > mp.max_transaction_minor:
             add("merchant", mid, "max_transaction", Effect.DENY, "MERCHANT_TRANSACTION_LIMIT",
                 f"{_fmt(amt, cur)} exceeds the merchant's maximum agent purchase of {_fmt(mp.max_transaction_minor, cur)}.",
@@ -250,8 +314,8 @@ def _evaluate(f: EvaluationInput, p: PolicySnapshot) -> PolicyDecision:
                 mp.approval_required_above_minor, amt)
 
     # ---- agent -----------------------------------------------------------------------------
-    if p.agent:
-        aid, _, ap = p.agent
+    if docs["agent"]:
+        aid, _, ap = docs["agent"]
         if not ap.enabled:
             add("agent", aid, "enabled", Effect.DENY, "AGENT_POLICY_DISABLED", "Agent's spending authority is disabled.")
         if amt > ap.max_transaction_minor:
@@ -270,6 +334,8 @@ def _evaluate(f: EvaluationInput, p: PolicySnapshot) -> PolicyDecision:
     limits: dict[str, int | None] = {}
     for scope_key, limit in budget_scopes(p, f.agent_id, f.user_id):
         used = f.budget_used_minor.get(scope_key, 0)
+        if used < 0:
+            raise ValueError(f"budget usage for {scope_key} is negative")
         remaining = max(limit - used, 0)
         limits[f"budget_remaining[{scope_key}]"] = remaining
         if amt > remaining:
@@ -278,16 +344,22 @@ def _evaluate(f: EvaluationInput, p: PolicySnapshot) -> PolicyDecision:
                 f"(limit {_fmt(limit, cur)}, used {_fmt(used, cur)}).", limit, used + amt)
 
     # ---- effective per-transaction limit -----------------------------------------------------
+    def rule(scope: str, attr: str) -> int | None:
+        doc = docs[scope]
+        return getattr(doc[2], attr) if doc else None
+
     caps = {
-        "system.hard_max_transaction": p.system[2].hard_max_transaction_minor if p.system else None,
-        "org.max_transaction": p.org[2].max_transaction_minor if p.org else None,
-        "user.max_transaction": p.user[2].max_transaction_minor if p.user else None,
-        "merchant.max_transaction": p.merchant[2].max_transaction_minor if p.merchant else None,
-        "agent.max_transaction": p.agent[2].max_transaction_minor if p.agent else None,
-        "user.approval_threshold": p.user[2].approval_threshold_minor if p.user else None,
+        "system.hard_max_transaction": rule("system", "hard_max_transaction_minor"),
+        "org.max_transaction": rule("org", "max_transaction_minor"),
+        "user.max_transaction": rule("user", "max_transaction_minor"),
+        "merchant.max_transaction": rule("merchant", "max_transaction_minor"),
+        "agent.max_transaction": rule("agent", "max_transaction_minor"),
     }
     limits.update(caps)
-    tx_caps = [v for k, v in caps.items() if k.endswith("max_transaction") and v is not None]
+    limits["user.approval_threshold"] = rule("user", "approval_threshold_minor")
+    limits["merchant.approval_required_above"] = rule("merchant", "approval_required_above_minor")
+    limits["agent.approval_required_above"] = rule("agent", "approval_required_above_minor")
+    tx_caps = [v for v in caps.values() if v is not None]
     limits["effective_max_transaction"] = min(tx_caps) if tx_caps else None
 
     denies = [x for x in findings if x.effect == Effect.DENY]
