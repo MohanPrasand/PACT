@@ -31,7 +31,12 @@ export async function http<T>(path: string, opts: HttpOptions = {}): Promise<T> 
     });
   } catch (e) {
     if ((e as Error).name === "AbortError") throw e;
-    throw new ApiError(0, "NETWORK_ERROR", "Cannot reach the PACT server");
+    // fetch() throws a TypeError before sending when a header value is invalid (e.g. a pasted token with
+    // non-ASCII characters or line breaks). That is not a network problem; say so.
+    if (e instanceof TypeError && /bytestring|header/i.test(e.message)) {
+      throw new ApiError(0, "INVALID_HEADER_VALUE", `The browser refused to build the request (${e.message}).`);
+    }
+    throw new ApiError(0, "NETWORK_ERROR", `Cannot reach the PACT server (${(e as Error).message || "no details"})`);
   }
   const text = await res.text();
   let data: unknown = null;
