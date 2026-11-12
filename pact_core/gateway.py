@@ -27,6 +27,9 @@ from pact_core.state_machine import transition
 LIVE = (State.EXECUTING.value, State.UNKNOWN.value)
 NOT_READY = {"ORDER_NOT_APPROVED", "PAYER_ACTION_REQUIRED"}
 BUYER_RETRY = {"INSTRUMENT_DECLINED"}
+# "No such order" from the provider: the simulation adapter's code and PayPal's 404 issue (#38).
+NOT_FOUND = {"RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID"}
+CAPTURE_OUTCOME_UNKNOWN = "PROVIDER_TIMEOUT_ON_CAPTURE"
 
 
 class ExecuteInput(BaseModel):
@@ -154,9 +157,23 @@ class ExecutionGateway:
             if exc.code in NOT_READY | BUYER_RETRY:
                 self._note_status(request_id, exc.code)
                 return self._view(request_id)
-            # Already captured, or an unexpected error: ask the provider before deciding anything.
-            return self._reconcile_with(request_id, adapter, poid)
+            return self._after_capture_rejected(request_id, adapter, poid, exc)
         return self._finalize(request_id, po)
+
+    def _after_capture_rejected(self, request_id: str, adapter, poid: str, exc: ProviderError) -> dict[str, Any]:
+        """The provider refused this capture call. Look at the order once and decide; never capture again
+        from here (#39: capture -> reconcile -> capture recursed without bound)."""
+        try:
+            po = adapter.get_order(poid)
+        except (ProviderTimeout, ProviderError):
+            self._note_status(request_id, exc.code)  # cannot tell yet; the next poll retries
+            return self._view(request_id)
+        if po.status == "COMPLETED" or po.capture_id or po.capture_status:
+            return self._finalize(request_id, po)  # e.g. ORDER_ALREADY_CAPTURED: money moved earlier
+        if exc.retryable:
+            self._note_status(request_id, exc.code)  # rate limit / transient auth: the next poll retries
+            return self._view(request_id)
+        return self._fail(request_id, f"CAPTURE_REJECTED:{exc.code}")
 
     def _finalize(self, request_id: str, po: ProviderOrder) -> dict[str, Any]:
         ctx = self.ctx
@@ -221,11 +238,22 @@ class ExecutionGateway:
             adapter = ctx.adapters[req.provider]
         try:
             po = adapter.get_order(provider_order_id)
-        except (ProviderTimeout, ProviderError):
-            return self._unknown(rid, "CANCEL_UNVERIFIED", "could not confirm provider state after buyer cancel")
-        if po.status == "COMPLETED":
+        except ProviderTimeout:
+            return self._cancel_unverified(rid)
+        except ProviderError as exc:
+            if exc.code not in NOT_FOUND:
+                return self._cancel_unverified(rid)
+            if self._not_found_after_unknown_capture(rid, exc.code):
+                return self._view(rid)
+            po = None  # no order at the provider, so nothing was captured
+        if po is not None and po.status == "COMPLETED":
             return self._finalize(rid, po)
         return self._fail(rid, "BUYER_CANCELLED", merchant_status="CANCELLED")
+
+    def _cancel_unverified(self, request_id: str) -> dict[str, Any]:
+        if self._capture_outcome_unknown(request_id):
+            return self._view(request_id)  # keep PROVIDER_TIMEOUT_ON_CAPTURE: it guards against a later 404
+        return self._unknown(request_id, "CANCEL_UNVERIFIED", "could not confirm provider state after buyer cancel")
 
     def abandon(self, request_id: str, actor: str) -> dict[str, Any]:
         """Operator cancels a payment stuck in checkout (e.g. the buyer gave up). The provider is asked first:
@@ -248,9 +276,13 @@ class ExecutionGateway:
             try:
                 po = adapter.get_order(poid)
             except (ProviderTimeout, ProviderError) as exc:
-                raise Conflict("CANNOT_VERIFY_PROVIDER",
-                               f"Could not confirm the provider state ({type(exc).__name__}); try again later") from None
-            if po.status == "COMPLETED":
+                gone = isinstance(exc, ProviderError) and exc.code in NOT_FOUND
+                # Gone means no order, so no capture - unless a capture call's outcome is still unknown.
+                if not gone or self._not_found_after_unknown_capture(request_id, exc.code):
+                    raise Conflict("CANNOT_VERIFY_PROVIDER",
+                                   f"Could not confirm the provider state ({type(exc).__name__}); try again later") from None
+                po = None
+            if po is not None and po.status == "COMPLETED":
                 return self._finalize(request_id, po)
         with ctx.db.transaction() as s:
             ctx.audit(s, "CANCEL_REQUESTED", actor, request_id, provider_order_id=poid)
@@ -281,7 +313,7 @@ class ExecutionGateway:
         except ProviderTimeout:
             return self._view(request_id)
         except ProviderError as exc:
-            if exc.code == "RESOURCE_NOT_FOUND":
+            if exc.code in NOT_FOUND and not self._not_found_after_unknown_capture(request_id, exc.code):
                 return self._fail(request_id, "PROVIDER_ORDER_NOT_FOUND")
             return self._view(request_id)
         with ctx.db.transaction() as s:
@@ -305,6 +337,24 @@ class ExecutionGateway:
         return self._view(request_id)
 
     # ------------------------------------------------------------------ state helpers
+    def _capture_outcome_unknown(self, request_id: str) -> bool:
+        with self.ctx.db.transaction() as s:
+            return self.ctx.load_request(s, request_id).failure_reason == CAPTURE_OUTCOME_UNKNOWN
+
+    def _not_found_after_unknown_capture(self, request_id: str, code: str) -> bool:
+        """True when a capture call had an unknown outcome, so "order not found" must not release funds:
+        the request stays UNKNOWN for manual review and the 404 is audited (once, not on every poll)."""
+        ctx = self.ctx
+        with ctx.db.transaction() as s:
+            req = ctx.load_request(s, request_id)
+            if req.failure_reason != CAPTURE_OUTCOME_UNKNOWN:
+                return False
+            if req.provider_status != code:
+                req.provider_status = code
+                ctx.audit(s, "RECONCILED", "gateway", req.id, action="hold_unknown_capture_order_not_found",
+                          provider_code=code, provider_order_id=req.provider_order_id)
+            return True
+
     def _unknown(self, request_id: str, reason: str, detail: str) -> dict[str, Any]:
         ctx = self.ctx
         with ctx.db.transaction() as s:
