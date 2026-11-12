@@ -6,7 +6,7 @@
 AI Agent → MCP → PACT Policy Engine → Shared Budget → Human Approval → Restricted Grant → PayPal Sandbox → Audit
 ```
 
-> **Status:** in development for the PayPal AI Hackathon. Phases 1–2 are complete: the full governed payment flow (policy → shared budget → human approval → single-use grant → PayPal Sandbox → audit) works in the core and has been verified live against PayPal Sandbox up to buyer approval. The REST API, CLI and MCP server are in place, so Claude Code can run the whole purchase. Next: dashboard and storefront UI. See the [roadmap](#roadmap) and [epic #18](https://github.com/MohanPrasand/PACT/issues/18).
+> **Status:** in development for the PayPal AI Hackathon. Phases 1–2 are complete: the full governed payment flow (policy → shared budget → human approval → single-use grant → payment provider → audit) works in the core and runs end to end with the simulation adapter. Against the live PayPal Sandbox, only OAuth, order creation and order retrieval have been verified; no PayPal-mode payment has yet reached buyer approval or capture, so those steps are covered by automated tests with a mocked PayPal only. The REST API, CLI and MCP server are in place, so Claude Code can run the whole purchase in simulation mode. Next: dashboard and storefront UI. See the [roadmap](#roadmap) and [epic #18](https://github.com/MohanPrasand/PACT/issues/18).
 
 ---
 
@@ -27,6 +27,8 @@ uv run pact approve              # (from the PACT repo) when Claude says it is w
 
 Open the checkout link Claude gives you and pay. Claude waits for both human steps and confirms the purchase by itself.
 Anything off? `uv run pact doctor` tells you what and how to fix it. Details: [`examples/claude_code/`](examples/claude_code/README.md).
+
+**PayPal mode.** You need a Sandbox business account, a REST app created under it, and a separate personal Sandbox account for the buyer: see [`docs/paypal-sandbox-setup.md`](docs/paypal-sandbox-setup.md). In PayPal mode `pact doctor` gets an OAuth token and then creates one small test order that nobody pays. It prints the business account that will receive the money and reminds you that the buyer must log in with a different, personal Sandbox account. A passing doctor shows the app and the business account work; it does not test the buyer login, approval or capture.
 
 ## Why PACT
 
@@ -107,6 +109,8 @@ stateDiagram-v2
 
 A provider timeout moves a payment to `UNKNOWN`. It is reconciled against the provider and never retried blindly.
 
+While a request is `EXECUTING` the buyer is at the provider's checkout page. Cancelling there or having a payment method declined does not end the request: the buyer can retry at the same `approval_url`. It ends `FAILED` only on an explicit cancel, a capture the provider rejects, a provider order that no longer exists, or the checkout timeout (`PACT_CHECKOUT_TTL_SECONDS`). See [checkout lifecycle](docs/architecture.md#8-checkout-lifecycle-after-execution-starts).
+
 ## What's implemented
 
 | Component | Status | Where |
@@ -122,14 +126,14 @@ A provider timeout moves a payment to `UNKNOWN`. It is reconciled against the pr
 | Execution gateway (validation chain, UNKNOWN + reconciliation) | ✅ merged | `pact_core/gateway.py` |
 | `PactCore` entry point for REST/MCP | ✅ merged | `pact_core/core.py` |
 | Merchant Lab (catalogue, cart, orders, payment status, seed) | ✅ merged | `merchant_lab/` |
-| PayPal Sandbox adapter (Orders v2) + simulation adapter | ✅ merged | `adapters/` |
-| REST API, CLI (`pact init/serve/verify-audit`), PayPal return/cancel routes | ✅ | `pact_server/` |
+| PayPal Sandbox adapter (Orders v2) + simulation adapter. Live-verified: OAuth, create order, get order. Capture: mocked tests only | ✅ merged | `adapters/` |
+| REST API, CLI (`pact init/serve/verify-audit`), PayPal return/cancel routes (exercised with the simulation adapter and mocked PayPal, not yet by a live PayPal buyer) | ✅ | `pact_server/` |
 | MCP server (16 tools incl. `pact_wait_for_status`; no approval tool) | ✅ | `pact_mcp/` |
-| Operator CLI: `pact demo`, `doctor`, `approve`, `stop`, server lock | ✅ | `pact_server/cli.py`, `pact_server/ops.py` |
+| Operator CLI: `pact demo`, `doctor` (PayPal mode: OAuth + one unpaid test order), `approve`, `cancel`, `stop`, server lock | ✅ | `pact_server/cli.py`, `pact_server/ops.py` |
 | Dashboard and storefront UI | ⏳ Phase 6 (#14, #22–#25) | |
 | E2E demo, security review, deployment | ⏳ Phase 7 (#15–#17) | |
 
-PayPal Sandbox has been verified live (OAuth, order creation, retrieval, and a full PACT-governed request → approval → grant → PayPal order run). INR is rejected by PayPal for this account type (`CURRENCY_NOT_SUPPORTED`), so the demo settles in **USD**.
+**What has been verified live against PayPal Sandbox:** OAuth, order creation and order retrieval, including a PACT-governed request → human approval in PACT → grant → PayPal order creation. **What has not:** no PayPal-mode payment has yet reached buyer approval on PayPal's page or capture. The return, cancel, capture, settlement and reconciliation paths are tested against the simulation adapter and a mocked PayPal API only. INR is rejected by PayPal for this account type (`CURRENCY_NOT_SUPPORTED`), so the demo settles in **USD**.
 
 ## Policy model
 
@@ -167,7 +171,7 @@ pact_server/          REST API (FastAPI) and `pact` CLI
 pact_mcp/             MCP server for Claude Code (thin client, agent key only)
 examples/             claude_code/ setup, paypal_sandbox_check.py (live credential check)
 specification/        project spec, policy reference and example policies
-docs/                 architecture and implementation plans
+docs/                 architecture, PayPal Sandbox setup guide and implementation plans
 tests/                pytest suite
 .github/workflows/    CI
 ```
@@ -192,17 +196,19 @@ Tests never read `.env` and need no PayPal credentials. CI (`.github/workflows/c
 |---|---:|
 | State machine | 317 |
 | Policy engine | 218 |
-| PayPal + simulation adapters | 193 |
+| PayPal + simulation adapters | 212 |
 | Merchant Lab | 140 |
 | Grant manager | 75 |
 | Budget engine | 57 |
-| Configuration | 53 |
-| Authorization service + execution gateway | 50 |
-| REST API + MCP server | 23 |
-| Demo convenience (wait tool, CLI, doctor, lock) | 16 |
+| Configuration | 62 |
+| Authorization service + execution gateway | 61 |
+| REST API + MCP server | 24 |
+| Demo convenience (wait tool, CLI, doctor, lock) | 24 |
 | Audit log | 42 |
 | Persistence and concurrency | 6 |
-| **Total** | **1190** |
+| **Total** | **1238** |
+
+Counts are per test file, collected on the `fix/paypal-gateway` integration branch at `9aa4730` plus the MCP instruction test added with this README update. The checkout lifecycle work (#40–#42) adds tests that are not counted here.
 
 ### Branching
 
@@ -224,6 +230,7 @@ Settings are read from environment variables or `.env` (see `.env.example`). Inv
 | `PAYPAL_CLIENT_SECRET` | — | PayPal Sandbox app secret (server-side only, never logged) |
 | `PAYPAL_BASE_URL` | `https://api-m.sandbox.paypal.com` | Must be a Sandbox (or local test) URL; live PayPal is rejected |
 | `PAYPAL_TIMEOUT_SECONDS` | `15` | HTTP timeout for PayPal calls |
+| `PAYPAL_LANDING_PAGE` | `LOGIN` | First page PayPal shows the buyer: `LOGIN` (PayPal login), `GUEST_CHECKOUT` (card form) or `NO_PREFERENCE` (PayPal decides) |
 | `PACT_PAYMENT_PROVIDER` | `simulation` | `simulation` or `paypal`; `paypal` requires both PayPal credentials |
 | `PACT_DATABASE_URL` | `sqlite:///./pact.db` | SQLAlchemy database URL |
 | `PACT_ADMIN_TOKEN` | — | Dashboard/approval bearer token; never given to agents |
@@ -232,6 +239,9 @@ Settings are read from environment variables or `.env` (see `.env.example`). Inv
 | `PACT_GRANT_TTL_SECONDS` | `600` | Payment grant lifetime |
 | `PACT_APPROVAL_TTL_SECONDS` | `1800` | Human approval window |
 | `PACT_EXPIRY_SWEEP_SECONDS` | `15` | Interval of the expiry sweeper |
+| `PACT_CHECKOUT_TTL_SECONDS` | `3600` | How long a checkout may stay `EXECUTING` after the grant is used. The sweeper then checks the provider: a captured payment is finalized, otherwise the request ends `FAILED / CHECKOUT_TIMEOUT` and its budget is released. `0` disables the timeout |
+
+PayPal Sandbox account setup (business account, REST app, personal buyer account): [`docs/paypal-sandbox-setup.md`](docs/paypal-sandbox-setup.md).
 
 ## Roadmap
 

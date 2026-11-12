@@ -32,6 +32,12 @@ INSTRUCTIONS = """PACT governs every payment you make. Rules:
 7. Never edit PACT's .env or configuration, never start, stop or restart the PACT server, never run PACT's admin
    commands (pact approve/deny/init/demo) and never read PACT's secrets. If PACT is unreachable, tell the user to
    run `pact doctor`. Approval is a human decision; working around it defeats the purpose of PACT.
+8. A cancelled or declined checkout is not a failed payment. While the state is EXECUTING with provider_status
+   BUYER_CANCELLED or INSTRUMENT_DECLINED, the buyer can retry at the SAME approval_url: give it to the user again and
+   keep waiting with pact_wait_for_status. Do not create a new order or request a new authorization for this
+   purchase unless the request is in a terminal state (FAILED, EXPIRED, REVOKED, DENIED).
+9. When a payment ends FAILED, report failure_reason exactly as returned (for example CHECKOUT_TIMEOUT,
+   CAPTURE_REJECTED:<code>, PROVIDER_ORDER_NOT_FOUND, BUYER_CANCELLED). Do not guess the cause or retry on your own.
 Typical flow: merchant_search_products -> merchant_add_to_cart -> merchant_checkout_cart -> pact_request_authorization
 -> (PENDING_APPROVAL) pact_wait_for_status -> pact_execute_action -> share approval_url -> pact_wait_for_status
 -> report EXECUTED (or the exact failure) to the user."""
@@ -172,7 +178,9 @@ def build_server(http: httpx.Client, *, poll_seconds: float = 2.0) -> MCPServer:
     async def pact_wait_for_status(request_id: str, timeout_seconds: int = 120) -> dict:
         """Wait until a request no longer needs a human: returns when the human approves (state GRANTED, with the
         single-use grant_token), denies, or completes checkout (EXECUTED/FAILED), or after timeout_seconds
-        (max 300). Use this instead of asking the user to tell you when they have approved or paid."""
+        (max 300). Use this instead of asking the user to tell you when they have approved or paid.
+        EXECUTING with provider_status BUYER_CANCELLED or INSTRUMENT_DECLINED is not final: the buyer can retry at
+        the same approval_url, so call this again. On FAILED, failure_reason holds the exact reason."""
         timeout = max(1, min(int(timeout_seconds), MAX_WAIT_SECONDS))
         started = time.monotonic()
         polls = 0
@@ -195,7 +203,8 @@ def build_server(http: httpx.Client, *, poll_seconds: float = 2.0) -> MCPServer:
     def pact_execute_action(request_id: str, grant_token: str, order_id: str, merchant_id: str, amount: str,
                             currency: str = "USD", idempotency_key: str | None = None) -> dict:
         """Execute an authorized payment with its single-use grant. Order, merchant, amount and currency must match
-        exactly. Returns an approval_url the user must open to complete checkout."""
+        exactly. Returns an approval_url the user must open to complete checkout. The same approval_url stays
+        valid if the buyer cancels or a payment method is declined; do not execute or authorize again."""
         minor = _amount(amount)
         if isinstance(minor, dict):
             return minor
