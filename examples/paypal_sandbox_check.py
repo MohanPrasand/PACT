@@ -5,9 +5,12 @@
 1. Obtains an OAuth access token (client credentials).
 2. Creates a small CAPTURE order and prints the buyer approval URL.
 3. With --capture ORDER_ID: captures an order you approved in the browser with a sandbox
-   personal account, and prints the capture result.
+   personal account, and prints the capture result. The capture uses the deterministic
+   idempotency key ``pact-check-capture-<ORDER_ID>``, so re-running it replays the same capture
+   instead of capturing twice.
 
-Credentials are read from .env; neither they nor the access token are printed.
+Credentials are read from .env; neither they nor the access token are printed. This script talks to
+the real PayPal Sandbox, so it is run manually only (never from the test suite).
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import argparse
 import secrets
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -23,6 +27,11 @@ from adapters.paypal.adapter import PayPalAdapter  # noqa: E402
 from pact_core.config import get_settings  # noqa: E402
 from pact_core.money import to_decimal_str  # noqa: E402
 from pact_core.ports import CreatePayment, ProviderError, ProviderTimeout  # noqa: E402
+
+
+def capture_check_key(order_id: str) -> str:
+    """Deterministic PayPal-Request-Id for ``--capture``: re-running replays rather than re-captures."""
+    return f"pact-check-capture-{order_id}"
 
 
 def main() -> int:
@@ -36,19 +45,28 @@ def main() -> int:
     if not s.paypal_client_id or not s.paypal_client_secret:
         print("FAIL: PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET are not set in .env")
         return 1
-    adapter = PayPalAdapter(
-        s.paypal_client_id, s.paypal_client_secret.get_secret_value(),
-        base_url=s.paypal_base_url, timeout=s.paypal_timeout_seconds,
-    )
+    if args.amount_minor <= 0:
+        print("FAIL: --amount-minor must be a positive integer")
+        return 1
+    try:
+        adapter = PayPalAdapter(
+            s.paypal_client_id, s.paypal_client_secret,
+            base_url=s.paypal_base_url, timeout=s.paypal_timeout_seconds,
+        )
+    except ValueError as e:
+        print(f"FAIL: {e}")
+        return 1
     currency = (args.currency or s.currency).upper()
-    print(f"Environment: {s.paypal_base_url}")
+    # Only scheme and host: never echo anything else from configuration.
+    parts = urlsplit(s.paypal_base_url)
+    print(f"Environment: {parts.scheme}://{parts.hostname}")
 
     try:
-        adapter._access_token()
+        adapter.verify_credentials()
         print("OK   OAuth access token obtained")
 
         if args.capture:
-            o = adapter.capture_order(args.capture, f"pact-check-capture-{args.capture}")
+            o = adapter.capture_order(args.capture, capture_check_key(args.capture))
             print(f"OK   Capture: order={o.provider_order_id} status={o.status} capture_id={o.capture_id} "
                   f"capture_status={o.capture_status} amount={o.captured_amount_minor} {o.captured_currency}")
             return 0
@@ -67,8 +85,10 @@ def main() -> int:
         print(f"FAIL {e.code}: {e.message}")
         return 1
     except ProviderTimeout as e:
-        print(f"FAIL timeout: {e}")
+        print(f"FAIL outcome unknown (timeout/5xx): {e}")
         return 1
+    finally:
+        adapter.close()
     return 0
 
 
