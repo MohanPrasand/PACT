@@ -5,7 +5,14 @@ const KEY = "pact.admin.token";
 export const adminToken = {
   get(): string | null {
     try {
-      return sessionStorage.getItem(KEY);
+      const t = sessionStorage.getItem(KEY);
+      if (t === null) return null;
+      // A stored value that is not plain visible ASCII can never be sent in a header: discard it.
+      if (!/^[\x21-\x7E]+$/.test(t)) {
+        sessionStorage.removeItem(KEY);
+        return null;
+      }
+      return t;
     } catch {
       return null;
     }

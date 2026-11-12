@@ -10,9 +10,14 @@ export function Login({ onLogin }: { onLogin: () => void }) {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    setBusy(true);
     setError(null);
-    adminToken.set(value.trim());
+    const token = value.trim();
+    if (!/^[\x21-\x7E]+$/.test(token)) {
+      setError(new Error("The token must be plain visible ASCII characters with no spaces. Paste only the value after '='."));
+      return;
+    }
+    setBusy(true);
+    adminToken.set(token);
     try {
       await adminApi("/admin/overview"); // validates the token; a 403 clears it
       onLogin();
