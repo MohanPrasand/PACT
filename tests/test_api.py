@@ -176,7 +176,7 @@ def test_policy_update_via_api(api):
 def test_overview_agents_budget(api):
     ov = api.get("/admin/overview", headers=ADMIN_H).json()
     assert {b["scope"] for b in ov["budgets"]} >= {"org:global", "user:u_demo", "agent:ag_shopping"}
-    assert {a["agent_id"] for a in ov["agents"]} == {"ag_shopping", "ag_research", "ag_procurement"}
+    assert {a["agent_id"] for a in ov["agents"]} == {"ag_shopping", "ag_research", "ag_procurement", "ag_storefront"}
     assert all("api_key_hash" not in a for a in ov["agents"])
     b = api.get("/v1/budget", headers=agent_h(api)).json()
     assert {s["scope"] for s in b["scopes"]} == {"org:global", "user:u_demo", "agent:ag_shopping"}

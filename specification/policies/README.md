@@ -14,6 +14,7 @@ The files in this directory are the demo configuration and are validated by the 
 | `agent.ag_shopping.json` | `agent:ag_shopping` | agent |
 | `agent.ag_research.json` | `agent:ag_research` | agent |
 | `agent.ag_procurement.json` | `agent:ag_procurement` | agent |
+| `agent.ag_storefront.json` | `agent:ag_storefront` | agent (web checkout identity) |
 
 ## Schemas
 

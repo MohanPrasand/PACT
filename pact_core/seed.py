@@ -16,7 +16,11 @@ DEMO_AGENTS = (
     ("ag_shopping", "Shopping agent", "Buys products for the user"),
     ("ag_research", "Research agent", "Buys datasets and information"),
     ("ag_procurement", "Procurement agent", "Pays approved suppliers"),
+    # Server-side identity for purchases made by a human on the Merchant Lab website (#24). Governed by PACT
+    # like any agent; its key is never handed to a browser.
+    ("ag_storefront", "Web storefront", "Human buyer checking out on the Merchant Lab website"),
 )
+STOREFRONT_AGENT = "ag_storefront"
 
 
 def _policy_id(stem: str) -> tuple[str, str, str]:
