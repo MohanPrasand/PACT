@@ -102,7 +102,8 @@ def build_adapters(settings: Settings, public_url: str) -> dict[str, PaymentAdap
 
         return {"paypal": PayPalAdapter(settings.paypal_client_id or "", settings.paypal_client_secret,
                                         base_url=settings.paypal_base_url,
-                                        timeout=settings.paypal_timeout_seconds)}
+                                        timeout=settings.paypal_timeout_seconds,
+                                        landing_page=settings.paypal_landing_page)}
     return {"simulation": SimulationAdapter(public_url)}
 
 

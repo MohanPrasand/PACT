@@ -47,6 +47,8 @@ _CURRENCY_RE = re.compile(r"[A-Z]{3}")
 _ORDER_ID_RE = re.compile(r"[A-Za-z0-9-]{1,64}")
 # Conservative PayPal-Request-Id bound (the historic documented limit; the current schema allows more).
 MAX_REQUEST_ID_LENGTH = 108
+# Where PayPal sends the buyer first: its login page, the guest card form, or PayPal's own choice.
+LANDING_PAGES = frozenset({"LOGIN", "GUEST_CHECKOUT", "NO_PREFERENCE"})
 # Refresh the token this long before PayPal says it expires.
 TOKEN_REFRESH_MARGIN_SECONDS = 60
 _MAX_MESSAGE = 300
@@ -98,6 +100,7 @@ class PayPalAdapter:
         base_url: str = SANDBOX_BASE_URL,
         timeout: float = 15.0,
         brand_name: str = "PACT Merchant Lab",
+        landing_page: str = "LOGIN",
         transport: httpx.BaseTransport | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -113,6 +116,9 @@ class PayPalAdapter:
             client_secret = client_secret.get_secret_value()
         if not client_id or not client_secret:
             raise ValueError("PayPal client id and client secret are required")
+        if not isinstance(landing_page, str) or landing_page not in LANDING_PAGES:
+            raise ValueError("PayPal landing_page must be one of " + ", ".join(sorted(LANDING_PAGES)))
+        self._landing_page = landing_page
         self._client_id = client_id
         self._client_secret = _Secret(client_secret)
         self._brand = brand_name
@@ -261,6 +267,7 @@ class PayPalAdapter:
                     "experience_context": {
                         "brand_name": self._brand[:127],
                         "shipping_preference": "NO_SHIPPING",
+                        "landing_page": self._landing_page,
                         "user_action": "PAY_NOW",
                         "return_url": req.return_url,
                         "cancel_url": req.cancel_url,
@@ -374,6 +381,13 @@ def _parse_order_body(data: dict) -> ProviderOrder:
         raw["amount"] = {"currency_code": amount.get("currency_code"), "value": amount.get("value")}
     if capture_reason:
         raw["capture_status_reason"] = capture_reason
+    # The receiving business account (not the buyer, not a credential): lets `pact doctor` show who gets paid.
+    payee_in = unit0.get("payee")
+    if isinstance(payee_in, dict):
+        payee = {k: payee_in[k] for k in ("merchant_id", "email_address")
+                 if isinstance(payee_in.get(k), str) and payee_in[k]}
+        if payee:
+            raw["payee"] = payee
 
     return ProviderOrder(
         provider_order_id=data.get("id") or "",
