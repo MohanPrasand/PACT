@@ -26,3 +26,9 @@ dashboard/dist/
 .vscode/
 .idea/
 .DS_Store
+
+# Claude Code agent worktrees
+.claude/worktrees/
+
+# Nuvai local tooling state
+.nuvai/

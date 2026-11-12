@@ -1,0 +1,6 @@
+{
+  "max_transaction_minor": 10000,
+  "allowed_categories": ["datasets"],
+  "allowed_agents": ["ag_research"],
+  "approval_required_above_minor": null
+}

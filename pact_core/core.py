@@ -1,0 +1,294 @@
+"""PactCore: the single entry point used by every interface (REST, MCP, tests).
+
+Agent-facing operations take an authenticated ``AgentIdentity``; admin operations take an admin actor
+name and must only be reachable behind admin authentication. No agent-facing operation can approve,
+deny or change policy.
+"""
+
+from __future__ import annotations
+
+import threading
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import select
+
+from pact_core import audit as audit_log
+from pact_core.authorization import AuthorizationInput, AuthorizationService
+from pact_core.crypto import constant_time_equal, sha256_hex
+from pact_core.db import Clock, Database, utcnow
+from pact_core.errors import Conflict, Forbidden, NotFound, PactError
+from pact_core.gateway import ExecuteInput, ExecutionGateway
+from pact_core.models import Agent, AuditEvent, AuthorizationRequest, Policy, State
+from pact_core.policy.engine import budget_scopes
+from pact_core.policy.rules import validate_rules
+from pact_core.ports import OrderSource, PaymentAdapter
+from pact_core.runtime import AgentIdentity, PactContext
+
+# Minimum time between provider lookups caused by status polls of one request while nothing changes (#42).
+STATUS_POLL_MIN_INTERVAL_SECONDS = 2.0
+_LIVE = (State.EXECUTING.value, State.UNKNOWN.value)
+
+
+class PactCore:
+    def __init__(self, db: Database, orders: OrderSource, adapters: dict[str, PaymentAdapter], *,
+                 provider: str, currency: str, public_url: str, grant_ttl_seconds: int = 600,
+                 approval_ttl_seconds: int = 1800, checkout_ttl_seconds: int = 3600, clock: Clock = utcnow):
+        self.ctx = PactContext(db=db, clock=clock, orders=orders, adapters=adapters, provider=provider,
+                               currency=currency, public_url=public_url, approval_ttl_seconds=approval_ttl_seconds,
+                               grant_ttl_seconds=grant_ttl_seconds, checkout_ttl_seconds=checkout_ttl_seconds)
+        self.auth = AuthorizationService(self.ctx)
+        self.gateway = ExecutionGateway(self.ctx)
+        # request id -> time of the last status-poll lookup that found nothing new (in memory, per process).
+        self._idle_polls: dict[str, datetime] = {}
+        self._idle_polls_lock = threading.Lock()
+
+    @property
+    def db(self) -> Database:
+        return self.ctx.db
+
+    # ------------------------------------------------------------------ identity
+    def authenticate_agent(self, api_key: str) -> AgentIdentity:
+        if not api_key:
+            raise Forbidden("AGENT_AUTH_REQUIRED", "Agent API key required", status_code=401)
+        digest = sha256_hex(api_key)
+        with self.db.transaction() as s:
+            agent = s.execute(select(Agent).where(Agent.api_key_hash == digest)).scalar_one_or_none()
+            if agent is None or not constant_time_equal(agent.api_key_hash, digest):
+                raise Forbidden("AGENT_AUTH_INVALID", "Invalid agent API key", status_code=401)
+            if not agent.active:
+                raise Forbidden("AGENT_INACTIVE", "Agent is disabled")
+            return AgentIdentity(id=agent.id, user_id=agent.user_id, name=agent.name)
+
+    def agent_identity(self, agent_id: str) -> AgentIdentity:
+        """Identity of a server-side agent (the web storefront) without an API key. Server-internal only:
+        never reachable from a request that supplies an agent id."""
+        with self.db.transaction() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is None:
+                raise NotFound("AGENT_NOT_FOUND", f"No agent {agent_id}; run `pact init` to seed it")
+            if not agent.active:
+                raise Forbidden("AGENT_INACTIVE", "Agent is disabled")
+            return AgentIdentity(id=agent.id, user_id=agent.user_id, name=agent.name)
+
+    # ------------------------------------------------------------------ agent operations
+    def request_authorization(self, agent: AgentIdentity, data: dict | AuthorizationInput) -> dict[str, Any]:
+        return self.auth.request_authorization(agent, _model(AuthorizationInput, data))
+
+    def evaluate_policy(self, agent: AgentIdentity, data: dict | AuthorizationInput) -> dict[str, Any]:
+        return self.auth.evaluate_policy(agent, _model(AuthorizationInput, data))
+
+    def get_status(self, agent: AgentIdentity, request_id: str) -> dict[str, Any]:
+        view = self.auth.get_status(agent, request_id)
+        if view["state"] in _LIVE and "grant_token" not in view and not self._polled_recently(request_id):
+            self.gateway.reconcile(request_id)  # pick up a buyer approval or resolve an UNKNOWN outcome
+            after = self.auth.get_status(agent, request_id)
+            self._note_poll(request_id, changed=_progress(after) != _progress(view))
+            view = after
+        return view
+
+    def _polled_recently(self, request_id: str) -> bool:
+        """True while the last status-poll lookup for this request found nothing new less than
+        STATUS_POLL_MIN_INTERVAL_SECONDS ago: the stored view is returned without asking the provider.
+        A lookup that did find something is never followed by a pause. Admin reconcile and the buyer
+        return/cancel paths are not throttled.
+
+        Time is ``ctx.clock``. A clock that has not moved at all since that lookup (a frozen clock, never a
+        real one) does not count as "recently": otherwise a stopped clock would switch polling off for good."""
+        with self._idle_polls_lock:
+            last = self._idle_polls.get(request_id)
+        return last is not None and _within_poll_interval(self.ctx.clock(), last)
+
+    def _note_poll(self, request_id: str, *, changed: bool) -> None:
+        now = self.ctx.clock()
+        with self._idle_polls_lock:
+            if changed:
+                self._idle_polls.pop(request_id, None)
+                return
+            self._idle_polls[request_id] = now
+            if len(self._idle_polls) > 1024:  # forget requests nobody polls any more
+                for rid, last in list(self._idle_polls.items()):
+                    if rid != request_id and not _within_poll_interval(now, last):
+                        del self._idle_polls[rid]
+
+    def execute(self, agent: AgentIdentity, data: dict | ExecuteInput) -> dict[str, Any]:
+        return self.gateway.execute(agent, _model(ExecuteInput, data))
+
+    def revoke(self, agent: AgentIdentity, request_id: str) -> dict[str, Any]:
+        return self.auth.revoke(request_id, agent=agent)
+
+    def agent_audit(self, agent: AgentIdentity, request_id: str | None = None, limit: int = 100) -> list[dict]:
+        with self.db.transaction() as s:
+            own = select(AuthorizationRequest.id).where(AuthorizationRequest.agent_id == agent.id)
+            q = select(AuditEvent).where(AuditEvent.request_id.in_(own))
+            if request_id:
+                q = q.where(AuditEvent.request_id == request_id)
+            rows = s.execute(q.order_by(AuditEvent.seq.desc()).limit(_limit(limit))).scalars()
+            return [audit_log.to_dict(e) for e in rows]
+
+    def budget_status(self, agent: AgentIdentity | None = None) -> dict[str, Any]:
+        """Shared budget usage for the current period: org, user and (for an agent) its own cap."""
+        with self.db.transaction() as s:
+            agents = [agent] if agent else [
+                AgentIdentity(a.id, a.user_id, a.name) for a in s.execute(select(Agent).order_by(Agent.id)).scalars()]
+            seen: dict[str, dict] = {}
+            for a in agents:
+                snap = self.ctx.snapshot(s, agent_id=a.id, user_id=a.user_id, merchant_id="")
+                for key, limit in budget_scopes(snap, a.id, a.user_id):
+                    if key not in seen:
+                        seen[key] = self.ctx.budget.usage(s, key, limit).as_dict()
+            return {"currency": self.ctx.currency, "scopes": list(seen.values())}
+
+    # ------------------------------------------------------------------ admin operations
+    def approve(self, admin: str, request_id: str, expected_request_hash: str, note: str = "") -> dict[str, Any]:
+        return self.auth.approve(admin, request_id, expected_request_hash, note)
+
+    def deny(self, admin: str, request_id: str, reason: str = "") -> dict[str, Any]:
+        return self.auth.deny(admin, request_id, reason)
+
+    def admin_revoke(self, admin: str, request_id: str) -> dict[str, Any]:
+        return self.auth.revoke(request_id, admin=admin)
+
+    def cancel_payment(self, admin: str, request_id: str, *, force: bool = False) -> dict[str, Any]:
+        return self.gateway.abandon(request_id, f"admin:{admin}", force=force)
+
+    def reconcile(self, request_id: str) -> dict[str, Any]:
+        return self.gateway.reconcile(request_id)
+
+    def expire_stale(self) -> list[str]:
+        """Expire stale authorizations and time out abandoned checkouts; returns the ids it expired."""
+        return self.auth.expire_stale(self.gateway.expire_checkout)
+
+    def list_requests(self, state: str | None = None, limit: int = 100) -> list[dict]:
+        from pact_core.runtime import request_view
+
+        with self.db.transaction() as s:
+            q = select(AuthorizationRequest).order_by(AuthorizationRequest.created_at.desc()).limit(_limit(limit))
+            if state:
+                q = q.where(AuthorizationRequest.state == state)
+            return [request_view(r, self.ctx.grant_for(s, r.id)) for r in s.execute(q).scalars()]
+
+    def latest_request_for_order(self, order_id: str) -> dict[str, Any] | None:
+        """Most recent authorization request for an order (any agent), or None."""
+        from pact_core.runtime import request_view
+
+        with self.db.transaction() as s:
+            req = s.execute(select(AuthorizationRequest).where(AuthorizationRequest.order_id == order_id)
+                            .order_by(AuthorizationRequest.created_at.desc(), AuthorizationRequest.id.desc())
+                            .limit(1)).scalar_one_or_none()
+            return None if req is None else request_view(req, self.ctx.grant_for(s, req.id))
+
+    def request_detail(self, request_id: str) -> dict[str, Any]:
+        view = self.auth.view(request_id)
+        with self.db.transaction() as s:
+            req = self.ctx.load_request(s, request_id)
+            view["order_snapshot"] = req.order_snapshot
+            view["reservations"] = [
+                {"scope": r.scope_key, "period": r.period, "amount_minor": r.amount_minor, "status": r.status}
+                for r in self.ctx.budget.active_reservations(s, request_id)]
+            events = s.execute(select(AuditEvent).where(AuditEvent.request_id == request_id)
+                               .order_by(AuditEvent.seq)).scalars()
+            view["audit"] = [audit_log.to_dict(e) for e in events]
+        view["merchant_name"] = self.ctx.orders.merchant_name(view["merchant_id"])
+        view["order_current"] = self.ctx.orders.order_summary(view["order_id"])
+        return view
+
+    def audit_events(self, *, request_id: str | None = None, event_type: str | None = None,
+                     limit: int = 200) -> list[dict]:
+        with self.db.transaction() as s:
+            q = select(AuditEvent)
+            if request_id:
+                q = q.where(AuditEvent.request_id == request_id)
+            if event_type:
+                q = q.where(AuditEvent.event_type == event_type)
+            return [audit_log.to_dict(e) for e in s.execute(q.order_by(AuditEvent.seq.desc()).limit(_limit(limit))).scalars()]
+
+    def verify_audit(self) -> dict[str, Any]:
+        with self.db.transaction() as s:
+            return audit_log.verify_chain(s)
+
+    def list_agents(self) -> list[dict]:
+        """Agents with today's spend against their own cap. API key hashes are never exposed."""
+        budgets = {s["scope"]: s for s in self.budget_status()["scopes"]}
+        with self.db.transaction() as s:
+            return [{"agent_id": a.id, "name": a.name, "description": a.description, "user_id": a.user_id,
+                     "active": a.active, "created_at": a.created_at.isoformat() + "Z",
+                     "budget": budgets.get(f"agent:{a.id}")}
+                    for a in s.execute(select(Agent).order_by(Agent.id)).scalars()]
+
+    def overview(self) -> dict[str, Any]:
+        with self.db.transaction() as s:
+            from sqlalchemy import func
+
+            counts = dict(s.execute(select(AuthorizationRequest.state, func.count())
+                                    .group_by(AuthorizationRequest.state)).all())
+        return {"currency": self.ctx.currency, "provider": self.ctx.provider,
+                "budgets": self.budget_status()["scopes"], "agents": self.list_agents(),
+                "requests_by_state": counts, "pending_approvals": counts.get(State.PENDING_APPROVAL.value, 0),
+                "recent": self.list_requests(limit=10), "audit": self.verify_audit()}
+
+    def list_policies(self) -> list[dict]:
+        with self.db.transaction() as s:
+            return [{"id": p.id, "scope": p.scope, "subject": p.subject, "rules": p.rules, "version": p.version,
+                     "updated_at": p.updated_at.isoformat() + "Z", "updated_by": p.updated_by}
+                    for p in s.execute(select(Policy).order_by(Policy.id)).scalars()]
+
+    def update_policy(self, admin: str, policy_id: str, rules: dict, expected_version: int) -> dict:
+        """Replace a policy document. Validated strictly; optimistic concurrency via ``expected_version``."""
+        with self.db.transaction() as s:
+            p = s.get(Policy, policy_id)
+            if p is None:
+                raise NotFound("POLICY_NOT_FOUND", f"No policy {policy_id}")
+            if p.version != expected_version:
+                raise Conflict("POLICY_VERSION_CONFLICT", f"Policy is at version {p.version}, not {expected_version}")
+            try:
+                clean = validate_rules(p.scope, rules)
+            except ValueError as exc:
+                raise PactError("POLICY_INVALID", "Policy document failed validation",
+                                details={"errors": _errors(exc)}) from None
+            before = p.rules
+            p.rules, p.version, p.updated_at, p.updated_by = clean, p.version + 1, self.ctx.clock(), f"admin:{admin}"
+            self.ctx.audit(s, "POLICY_UPDATED", f"admin:{admin}", None, policy_id=p.id, version=p.version,
+                           before=before, after=clean)
+            return {"id": p.id, "scope": p.scope, "rules": p.rules, "version": p.version}
+
+    # ------------------------------------------------------------------ provider callbacks
+    def handle_provider_return(self, provider_order_id: str) -> dict[str, Any]:
+        return self.gateway.handle_provider_return(provider_order_id)
+
+    def handle_provider_cancel(self, provider_order_id: str) -> dict[str, Any]:
+        """Buyer followed the provider's cancel link. Not terminal: the request stays EXECUTING."""
+        return self.gateway.handle_provider_cancel(provider_order_id)
+
+    def buyer_abandon(self, provider_order_id: str) -> dict[str, Any]:
+        """Buyer explicitly cancels this payment. Terminal (FAILED / BUYER_CANCELLED) unless already captured."""
+        return self.gateway.buyer_abandon(provider_order_id)
+
+
+def _within_poll_interval(now: datetime, last: datetime) -> bool:
+    return 0 < (now - last).total_seconds() < STATUS_POLL_MIN_INTERVAL_SECONDS
+
+
+def _progress(view: dict[str, Any]) -> tuple:
+    ex = view["execution"]
+    return (view["state"], ex["provider_status"], ex["capture_id"], ex["failure_reason"], ex["approval_url"])
+
+
+def _model(cls, data):
+    if isinstance(data, cls):
+        return data
+    try:
+        return cls.model_validate(data)
+    except ValueError as exc:
+        raise PactError("INVALID_REQUEST", "Request failed validation", details={"errors": _errors(exc)}) from None
+
+
+def _errors(exc: Exception) -> list:
+    errs = getattr(exc, "errors", None)
+    if callable(errs):
+        return [{"loc": list(e.get("loc", ())), "msg": e.get("msg")} for e in errs(include_input=False)]
+    return [str(exc)]
+
+
+def _limit(n: int) -> int:
+    return max(1, min(int(n), 500))
