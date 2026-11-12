@@ -5,6 +5,7 @@
     pact approvals            list payments waiting for your approval
     pact approve [ID] [--yes] approve exactly what is shown (the only pending one if ID is omitted)
     pact deny ID [REASON]     deny a pending payment
+    pact cancel [ID]          cancel a payment stuck in checkout (checks the provider first; lists them if no ID)
     pact init [--reset]       create tables and seed catalogue, policies and demo agents
     pact serve [--port N]     run the API (+ dashboard if built); refuses to start a second server
     pact stop                 stop the running server
@@ -40,14 +41,15 @@ def _seed(settings, reset: bool = False) -> dict:
     db = Database(settings.database_url)
     if reset:
         db.drop_all()
-        if ops.KEYS_FILE.exists():
-            ops.KEYS_FILE.unlink()
+        kf = ops.keys_file(settings.database_url)
+        if kf.exists():
+            kf.unlink()
     db.create_all()
     catalogue = seed_catalogue(db)
     policies = seed_policies(db)
     keys = seed_agents(db)
     if keys:
-        ops.save_keys(keys)
+        ops.save_keys(keys, ops.keys_file(settings.database_url))
     return {"db": db, "catalogue": catalogue, "policies": policies, "new_keys": keys}
 
 
@@ -61,10 +63,10 @@ def _init(args) -> int:
     print(f"Catalogue: {r['catalogue']['merchants_total']} merchants, {r['catalogue']['products_total']} products")
     print(f"Policies:  {len(r['policies'])} loaded" if r["policies"] else "Policies:  already present (kept)")
     if r["new_keys"]:
-        print(f"Agents:    {len(r['new_keys'])} created; API keys written to {ops.KEYS_FILE} (mode 600). "
+        print(f"Agents:    {len(r['new_keys'])} created; API keys written to {ops.keys_file(settings.database_url)} (mode 600). "
               "Only hashes are stored in the DB.")
     else:
-        print(f"Agents:    already present; keys are in {ops.KEYS_FILE}")
+        print(f"Agents:    already present; keys are in {ops.keys_file(settings.database_url)}")
     if not settings.admin_token:
         print("WARNING:   PACT_ADMIN_TOKEN is not set; approvals will be disabled.", file=sys.stderr)
     print(f"Provider:  {settings.payment_provider}  ·  currency {settings.currency}")
@@ -116,13 +118,14 @@ def _demo(args) -> int:
     r = _seed(settings)
     print(f" ✓ data          {r['catalogue']['products_total']} products, policies and demo agents ready")
 
-    keys = ops.load_keys()
+    kf = ops.keys_file(settings.database_url)
+    keys = ops.load_keys(kf)
     rotated = False
     if ops.SHOPPING_AGENT not in keys:
         keys[ops.SHOPPING_AGENT] = rotate_agent_key(r["db"], ops.SHOPPING_AGENT)
-        ops.save_keys({ops.SHOPPING_AGENT: keys[ops.SHOPPING_AGENT]})
+        ops.save_keys({ops.SHOPPING_AGENT: keys[ops.SHOPPING_AGENT]}, kf)
         rotated = True
-        print(f" ✓ agent key     issued a new key for {ops.SHOPPING_AGENT} ({ops.KEYS_FILE})")
+        print(f" ✓ agent key     issued a new key for {ops.SHOPPING_AGENT} ({kf})")
 
     shopper = Path(args.shopper_dir).expanduser()
     if not args.no_mcp:
@@ -211,6 +214,31 @@ def _deny(args) -> int:
     return 0
 
 
+def _cancel(args) -> int:
+    client = ops.ApprovalClient.from_settings(_settings())
+    if not args.request_id:
+        stuck = client.stuck()
+        if not stuck:
+            print("No payments are in progress.")
+            return 0
+        for p in stuck:
+            print(f"{p['request_id']}  {p['amount']} {p['currency']}  {p['state']}  provider={p['execution']['provider']} "
+                  f"status={p['execution']['provider_status']}")
+        print("\nCancel with:  pact cancel <request_id>")
+        return 0
+    try:
+        result = client.cancel(args.request_id)
+    except RuntimeError as exc:
+        print(f"✗ {exc}")
+        return 1
+    ex = result["execution"]
+    if result["state"] == "EXECUTED":
+        print(f"! {args.request_id} had already been paid at the provider; it was completed instead (capture {ex['capture_id']}).")
+    else:
+        print(f"✓ {args.request_id} -> {result['state']} ({ex['failure_reason']}); its budget reservation was released.")
+    return 0
+
+
 def _verify(_args) -> int:
     from pact_core import audit
     from pact_core.db import Database
@@ -248,6 +276,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("request_id")
     p.add_argument("reason", nargs="*")
     p.set_defaults(func=_deny)
+
+    p = sub.add_parser("cancel", help="cancel a payment stuck in checkout")
+    p.add_argument("request_id", nargs="?")
+    p.set_defaults(func=_cancel)
 
     p = sub.add_parser("init", help="create tables and seed demo data")
     p.add_argument("--reset", action="store_true", help="drop all tables first (destroys data)")

@@ -51,6 +51,17 @@ class PactCore:
                 raise Forbidden("AGENT_INACTIVE", "Agent is disabled")
             return AgentIdentity(id=agent.id, user_id=agent.user_id, name=agent.name)
 
+    def agent_identity(self, agent_id: str) -> AgentIdentity:
+        """Identity of a server-side agent (the web storefront) without an API key. Server-internal only:
+        never reachable from a request that supplies an agent id."""
+        with self.db.transaction() as s:
+            agent = s.get(Agent, agent_id)
+            if agent is None:
+                raise NotFound("AGENT_NOT_FOUND", f"No agent {agent_id}; run `pact init` to seed it")
+            if not agent.active:
+                raise Forbidden("AGENT_INACTIVE", "Agent is disabled")
+            return AgentIdentity(id=agent.id, user_id=agent.user_id, name=agent.name)
+
     # ------------------------------------------------------------------ agent operations
     def request_authorization(self, agent: AgentIdentity, data: dict | AuthorizationInput) -> dict[str, Any]:
         return self.auth.request_authorization(agent, _model(AuthorizationInput, data))
@@ -103,6 +114,9 @@ class PactCore:
     def admin_revoke(self, admin: str, request_id: str) -> dict[str, Any]:
         return self.auth.revoke(request_id, admin=admin)
 
+    def cancel_payment(self, admin: str, request_id: str) -> dict[str, Any]:
+        return self.gateway.abandon(request_id, f"admin:{admin}")
+
     def reconcile(self, request_id: str) -> dict[str, Any]:
         return self.gateway.reconcile(request_id)
 
@@ -117,6 +131,16 @@ class PactCore:
             if state:
                 q = q.where(AuthorizationRequest.state == state)
             return [request_view(r, self.ctx.grant_for(s, r.id)) for r in s.execute(q).scalars()]
+
+    def latest_request_for_order(self, order_id: str) -> dict[str, Any] | None:
+        """Most recent authorization request for an order (any agent), or None."""
+        from pact_core.runtime import request_view
+
+        with self.db.transaction() as s:
+            req = s.execute(select(AuthorizationRequest).where(AuthorizationRequest.order_id == order_id)
+                            .order_by(AuthorizationRequest.created_at.desc(), AuthorizationRequest.id.desc())
+                            .limit(1)).scalar_one_or_none()
+            return None if req is None else request_view(req, self.ctx.grant_for(s, req.id))
 
     def request_detail(self, request_id: str) -> dict[str, Any]:
         view = self.auth.view(request_id)

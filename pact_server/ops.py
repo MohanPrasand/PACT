@@ -6,6 +6,7 @@ PACT; agents are never given that token, and the MCP server instructs them never
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -23,7 +24,8 @@ from pact_core.config import Settings
 
 PACT_DIR = Path(".pact")
 LOCK_FILE = PACT_DIR / "server.lock"
-KEYS_FILE = PACT_DIR / "agent_keys.json"
+KEYS_FILE = PACT_DIR / "agent_keys.json"  # keys for the default database
+DEFAULT_DATABASE_URL = "sqlite:///./pact.db"
 SHOPPING_AGENT = "ag_shopping"
 
 
@@ -162,9 +164,10 @@ def run_doctor(settings: Settings, *, env_file: Path = Path(".env"), check_mcp: 
     except Exception as exc:  # report, don't crash the doctor
         checks.append(Check("Database seeded", False, type(exc).__name__, f"check PACT_DATABASE_URL ({settings.database_url})"))
 
-    keys = load_keys()
+    kf = keys_file(settings.database_url)
+    keys = load_keys(kf)
     checks.append(Check("Agent keys file", SHOPPING_AGENT in keys,
-                        str(KEYS_FILE) if keys else "missing",
+                        str(kf) if keys else "missing",
                         "run `pact demo` (it re-issues the shopping agent key if the file is lost)"))
 
     # Running server
@@ -209,17 +212,27 @@ def format_checks(checks: list[Check]) -> tuple[str, bool]:
 # ---------------------------------------------------------------------- keys
 
 
-def load_keys() -> dict[str, str]:
+def keys_file(database_url: str = DEFAULT_DATABASE_URL) -> Path:
+    """Agent keys belong to one database. The default database keeps ``.pact/agent_keys.json``; any other
+    database (tests, temp DBs, a second deployment) gets its own file so seeding it can never overwrite the
+    keys that the real database's agents use."""
+    if database_url == DEFAULT_DATABASE_URL:
+        return KEYS_FILE
+    return PACT_DIR / f"agent_keys.{hashlib.sha256(database_url.encode()).hexdigest()[:10]}.json"
+
+
+def load_keys(path: Path | None = None) -> dict[str, str]:
     try:
-        return json.loads(KEYS_FILE.read_text())
+        return json.loads((path or KEYS_FILE).read_text())
     except (OSError, ValueError):
         return {}
 
 
-def save_keys(keys: dict[str, str]) -> None:
-    PACT_DIR.mkdir(exist_ok=True)
-    merged = {**load_keys(), **keys}
-    fd = os.open(KEYS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def save_keys(keys: dict[str, str], path: Path | None = None) -> None:
+    path = path or KEYS_FILE
+    path.parent.mkdir(exist_ok=True)
+    merged = {**load_keys(path), **keys}
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(merged, f, indent=2)
 
@@ -254,6 +267,15 @@ class ApprovalClient:
     def approve(self, request_id: str, request_hash: str, note: str = "approved from terminal") -> dict:
         return self._json(self.http.post(f"/admin/authorizations/{request_id}/approve",
                                          json={"request_hash": request_hash, "note": note}))
+
+    def cancel(self, request_id: str) -> dict:
+        return self._json(self.http.post(f"/admin/authorizations/{request_id}/cancel"))
+
+    def stuck(self) -> list[dict]:
+        out = []
+        for state in ("EXECUTING", "UNKNOWN"):
+            out += self._json(self.http.get("/admin/authorizations", params={"state": state}))["authorizations"]
+        return out
 
     def deny(self, request_id: str, reason: str) -> dict:
         return self._json(self.http.post(f"/admin/authorizations/{request_id}/deny", json={"reason": reason}))

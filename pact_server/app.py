@@ -35,6 +35,7 @@ from pact_core.errors import Forbidden, PactError
 from pact_core.money import to_minor
 from pact_core.ports import PaymentAdapter
 from pact_core.runtime import AgentIdentity
+from pact_server.storefront import StorefrontService
 
 log = logging.getLogger("pact.server")
 DASHBOARD_DIST = Path(__file__).resolve().parents[1] / "dashboard" / "dist"
@@ -93,6 +94,10 @@ class CheckoutBody(_Body):
     buyer_ref: str = Field("", max_length=64)
 
 
+class WebCheckoutBody(_Body):
+    retry: bool = False
+
+
 # ---------------------------------------------------------------------- app factory
 
 
@@ -140,6 +145,7 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
 
     app = FastAPI(title="PACT — Policy and Authorization Control Tower", version="0.1.0", lifespan=lifespan,
                   description="Financial governance runtime for AI agents. Sandbox reference implementation.")
+    storefront = StorefrontService(core, lab)
     app.state.core, app.state.lab, app.state.settings = core, lab, settings
 
     # ------------------------------------------------------------------ errors
@@ -241,6 +247,17 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
     def get_order(order_id: str):
         return lab.get_order(order_id)
 
+    @app.get("/merchant/orders/{order_id}/status", tags=["merchant"])
+    def order_status(order_id: str):
+        """Merchant-safe order + PACT authorization progress (no tokens or policy internals). Sandbox: no auth."""
+        return storefront.order_status(order_id)
+
+    @app.post("/merchant/orders/{order_id}/checkout", tags=["merchant"])
+    def web_checkout(order_id: str, body: WebCheckoutBody | None = None):
+        """Human checkout on the website, governed by PACT as the `ag_storefront` identity. Idempotent: call
+        again to advance an in-flight attempt. It cannot approve; approval stays in the admin dashboard."""
+        return storefront.checkout(order_id, retry=bool(body and body.retry))
+
     @app.patch("/merchant/orders/{order_id}", tags=["merchant"])
     def update_order(order_id: str, body: OrderItemsBody):
         return lab.update_order_items(order_id, [i.model_dump() for i in body.items])
@@ -292,6 +309,10 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
     @app.post("/admin/authorizations/{request_id}/revoke", tags=["admin"])
     def admin_revoke(request_id: str, admin: str = Depends(admin_auth)):
         return core.admin_revoke(admin, request_id)
+
+    @app.post("/admin/authorizations/{request_id}/cancel", tags=["admin"])
+    def cancel_payment(request_id: str, admin: str = Depends(admin_auth)):
+        return core.cancel_payment(admin, request_id)
 
     @app.post("/admin/authorizations/{request_id}/reconcile", tags=["admin"])
     def reconcile(request_id: str, _admin: str = Depends(admin_auth)):
@@ -415,9 +436,12 @@ def _result_page(view: dict) -> HTMLResponse:
     dl = "".join(f"<dt>{html.escape(k)}</dt><dd>{html.escape(str(v))}</dd>" for k, v in rows.items() if v)
     hint = ""
     if ex.get("failure_reason") == "BUYER_CANCELLED" and ex.get("provider") == "paypal":
-        hint = ("<p class='warn'>Checkout was cancelled at PayPal. In PayPal <strong>Sandbox</strong>, log in with your "
-                "<strong>personal</strong> sandbox buyer account (developer.paypal.com → Testing Tools → Sandbox "
-                "Accounts, usually <code>…@personal.example.com</code>), not the business account that receives the "
-                "payment, and click <em>Pay</em>. Ask your agent to start a new purchase to try again.</p>")
+        hint = ("<p class='warn'>Checkout was cancelled at PayPal. In PayPal <strong>Sandbox</strong>, either log in "
+                "with the exact <strong>personal</strong> sandbox account email and password (developer.paypal.com → "
+                "Testing Tools → Sandbox Accounts → <code>sb-…@personal.example.com</code> → View/edit account) — if "
+                "PayPal shows a debit/credit card form after you enter an email, it did not recognise that email — "
+                "or pay on that card form with a test card from Testing Tools → Credit Card Generator (any future "
+                "expiry, any CVV). Never use the business account that receives the payment. Ask your agent to start "
+                "a new purchase to try again.</p>")
     return _page(headline, f"<p class='{cls}'><strong>{html.escape(state)}</strong></p><dl>{dl}</dl>{hint}"
                            "<p>You can close this tab — your agent picks up the result automatically.</p>")
