@@ -40,6 +40,7 @@ from pact_core.errors import Forbidden, PactError
 from pact_core.money import to_minor
 from pact_core.ports import PaymentAdapter
 from pact_core.runtime import AgentIdentity
+from pact_server.storefront import StorefrontService
 
 log = logging.getLogger("pact.server")
 DASHBOARD_DIST = Path(__file__).resolve().parents[1] / "dashboard" / "dist"
@@ -98,6 +99,10 @@ class CheckoutBody(_Body):
     buyer_ref: str = Field("", max_length=64)
 
 
+class WebCheckoutBody(_Body):
+    retry: bool = False
+
+
 # ---------------------------------------------------------------------- app factory
 
 
@@ -147,6 +152,7 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
 
     app = FastAPI(title="PACT — Policy and Authorization Control Tower", version="0.1.0", lifespan=lifespan,
                   description="Financial governance runtime for AI agents. Sandbox reference implementation.")
+    storefront = StorefrontService(core, lab)
     app.state.core, app.state.lab, app.state.settings = core, lab, settings
 
     # ------------------------------------------------------------------ errors
@@ -247,6 +253,17 @@ def create_app(settings: Settings | None = None, *, adapters: dict[str, PaymentA
     @app.get("/merchant/orders/{order_id}", tags=["merchant"])
     def get_order(order_id: str):
         return lab.get_order(order_id)
+
+    @app.get("/merchant/orders/{order_id}/status", tags=["merchant"])
+    def order_status(order_id: str):
+        """Merchant-safe order + PACT authorization progress (no tokens or policy internals). Sandbox: no auth."""
+        return storefront.order_status(order_id)
+
+    @app.post("/merchant/orders/{order_id}/checkout", tags=["merchant"])
+    def web_checkout(order_id: str, body: WebCheckoutBody | None = None):
+        """Human checkout on the website, governed by PACT as the `ag_storefront` identity. Idempotent: call
+        again to advance an in-flight attempt. It cannot approve; approval stays in the admin dashboard."""
+        return storefront.checkout(order_id, retry=bool(body and body.retry))
 
     @app.patch("/merchant/orders/{order_id}", tags=["merchant"])
     def update_order(order_id: str, body: OrderItemsBody):
