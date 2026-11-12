@@ -94,15 +94,15 @@ modified by this review.
 - Fix: `urllib.parse.quote(value, safe="")` every path segment (or reject ids not matching `^[A-Za-z0-9_:.-]+$`).
 - Test: `test_mcp_ids_cannot_traverse_to_other_api_paths` (SEC-3).
 
-### SEC-4 (Medium) Weak or placeholder admin token accepted
+### SEC-4 (Medium) Weak or placeholder admin token accepted — FIXED
 - Where: `pact_core/config.py:34` (`admin_token: SecretStr | None`, no validation), `.env.example:16`
   (`change-me-to-a-long-random-string`), `pact_server/app.py:125`.
 - Exploit: an operator who copies `.env.example` (or picks a short token) leaves a guessable credential guarding
   approvals and policy; combined with SEC-5 it is brute-forceable. The admin token is the single root of trust.
-- Fix: reject tokens shorter than 32 characters and the known placeholder at startup (`pact doctor` should flag it);
-  have `pact init` generate one.
-- Test: `test_weak_or_placeholder_admin_tokens_are_rejected_at_startup` (SEC-4). Note `test_config::test_env_example_template_loads`
-  loads the example file and will need updating together with the fix.
+- Fix (done): startup rejects tokens shorter than 16 characters and known placeholders (`change-me`, `example`, …)
+  without echoing the value; `.env.example` now leaves the token blank with the command to generate one.
+- Test: `test_weak_or_placeholder_admin_tokens_are_rejected_at_startup` (SEC-4). `test_config::test_env_example_template_loads`
+  still passes because the example token is blank (treated as unset).
 
 ### SEC-5 (Low/Medium) No rate limiting on authentication
 - Where: `pact_server/app.py:170-179` (`agent_auth`, `admin_auth`), `pact_core/core.py:42`.

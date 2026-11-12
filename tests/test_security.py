@@ -568,12 +568,12 @@ def test_responses_forbid_framing_and_sniffing(api):
         assert h.get("x-content-type-options") == "nosniff", path
 
 
-@pytest.mark.xfail(strict=True, reason="SEC-4: PACT_ADMIN_TOKEN accepts any value, including the .env.example "
-                                       "placeholder and one-character tokens")
 def test_weak_or_placeholder_admin_tokens_are_rejected_at_startup():
-    for weak in ("x", "admin", "change-me-to-a-long-random-string"):
-        with pytest.raises(ValueError):
+    for weak in ("x", "admin", "short-token-123", "change-me-to-a-long-random-string", "ChangeMe" + "x" * 30):
+        with pytest.raises(ValueError) as exc:
             Settings(_env_file=None, PACT_ADMIN_TOKEN=weak, PACT_DATABASE_URL="sqlite://")
+        assert weak not in str(exc.value)  # the rejected value is never echoed
+    Settings(_env_file=None, PACT_ADMIN_TOKEN="a-strong-random-token-0123456789", PACT_DATABASE_URL="sqlite://")
 
 
 @pytest.mark.xfail(strict=True, reason="SEC-5: no rate limiting or lockout on admin/agent authentication, so the "

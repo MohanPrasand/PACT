@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+MIN_ADMIN_TOKEN_LENGTH = 16
+_PLACEHOLDER_TOKEN_PARTS = ("change-me", "changeme", "placeholder", "your-token", "your_token", "example")
 _CURRENCY_RE = re.compile(r"[A-Z]{3}")
 # Hosts that can only ever reach a local mock/test server, never real PayPal.
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "testserver"})
@@ -50,6 +52,21 @@ class Settings(BaseSettings):
     # How long a buyer may leave a checkout open before PACT times it out and releases the reservation
     # (provider-checked: a captured or approved order is completed instead). 0 disables the timeout.
     checkout_ttl_seconds: int = Field(3600, ge=0, alias="PACT_CHECKOUT_TTL_SECONDS")
+
+    @field_validator("admin_token")
+    @classmethod
+    def _admin_token_is_strong(cls, value: SecretStr | None) -> SecretStr | None:
+        """The admin token approves payments and edits policy: refuse short or placeholder values (SEC-4).
+        The message never includes the value."""
+        if value is None:
+            return value
+        token = value.get_secret_value()
+        lowered = token.lower()
+        if len(token) < MIN_ADMIN_TOKEN_LENGTH or any(p in lowered for p in _PLACEHOLDER_TOKEN_PARTS):
+            raise ValueError(
+                f"PACT_ADMIN_TOKEN must be at least {MIN_ADMIN_TOKEN_LENGTH} characters and not a placeholder. "
+                'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"')
+        return value
 
     @field_validator("currency")
     @classmethod
